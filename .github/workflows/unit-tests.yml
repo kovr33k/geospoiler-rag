@@ -6,11 +6,17 @@ on:
 
 jobs:
   unit-tests:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     defaults:
       run:
         working-directory: GeoSpoiler-RAG-Hybrid
+        shell: pwsh
 
     steps:
       - uses: actions/checkout@v4
@@ -22,15 +28,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install ruff
+          python -m pip install -e '.[dev]'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Ruff report
-        run: python -m ruff check . --config pyproject.toml --exit-zero
+      - name: Ruff
+        run: python -m ruff check . --config pyproject.toml
 
-      - name: Unit tests without network
+      - name: Prepare tokenizer cache
         env:
-          GEOSPOILER_NO_NETWORK: "1"
-          PYTHONIOENCODING: utf-8
-          PYTHONUTF8: "1"
-        run: python -m unittest discover -p "test_*.py"
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/geospoiler-tokenizers
+        run: python -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.get_encoding('cl100k_base')"
+
+      - name: Full pytest without network
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/geospoiler-tokenizers
+        run: ./scripts/run_offline_tests.ps1 -Python python -RunRoot '${{ runner.temp }}/geospoiler-offline'
