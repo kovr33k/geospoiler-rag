@@ -104,7 +104,10 @@ python main.py enrich --llm-profile luna
 python main.py query --llm-profile luna "What is the source saying about Taiwan?"
 ```
 
-Codex calls run through an isolated read-only CLI process with concurrency 1.
+Codex calls run through isolated read-only CLI processes with a shared limit of
+three calls across synchronous text, asynchronous text and Luna media analysis.
+Enrichment also defaults to three workers. Translation and enrichment share
+these permits; embeddings retain their separate concurrency policy.
 The configured reasoning effort is passed explicitly even though the isolated
 process ignores the user's global Codex configuration. The model identity
 stored in generated metadata includes the effort, for example
