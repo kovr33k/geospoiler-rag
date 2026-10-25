@@ -109,3 +109,84 @@ def test_empty_input_does_not_publish_card(ingestion_runtime, monkeypatch):
     run_messages(monkeypatch, [message("   ")])
     assert ingestion_runtime == []
     assert not list(config.ENRICHED_DIR.rglob("*.enriched.json"))
+
+
+@pytest.mark.parametrize(("setting", "value"), [
+    ("CODEX_LUNA_MODEL", "isolated-future-model"), ("LLM_PROFILE", "current"),
+    ("CODEX_LUNA_REASONING_EFFORT", "isolated-future-effort"),
+])
+def test_ready_cards_survive_future_model_settings(ingestion_runtime, monkeypatch, setting, value):
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    card_file = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
+    before = card_file.read_bytes()
+    ingestion_runtime.clear()
+    monkeypatch.setattr(config, setting, value)
+    monkeypatch.setattr(config, "REGENERATE_ON_PROFILE_CHANGE", True)
+    result = cli.cmd_enrich()
+    assert ingestion_runtime == []
+    assert result.enrichment.skipped_up_to_date == 1
+    assert card_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("change", ["text", "metadata", "prompt", "missing", "corrupt", "unstable", "failed", "force"])
+def test_actual_invalidations_reprocess_card(ingestion_runtime, monkeypatch, change):
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    card_file = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
+    if change == "text":
+        path = config.NORMALIZED_DIR / "Acceptance/1.txt"
+        path.write_text(path.read_text(encoding="utf-8") + " Новые сведения.", encoding="utf-8")
+    elif change == "metadata":
+        path = config.NORMALIZED_DIR / "Acceptance/1.meta.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["post_url"] = "https://t.me/revised_source/1"
+        path.write_text(json.dumps(data), encoding="utf-8")
+    elif change == "prompt":
+        monkeypatch.setattr(config, "ENRICHMENT_PROMPT_VERSION", "isolated-new-rules")
+    elif change == "missing":
+        card_file.unlink()
+    elif change == "corrupt":
+        card_file.write_text("broken JSON", encoding="utf-8")
+    elif change == "unstable":
+        data = json.loads(card_file.read_text(encoding="utf-8"))
+        data["quality_flags"] = ["extraction_unstable"]
+        card_file.write_text(json.dumps(data), encoding="utf-8")
+    elif change == "failed":
+        progress_path = config.STATE_DIR / "enrichment_progress.json"
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress["failed"] = {"Acceptance/1": {"error": "controlled failure"}}
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    ingestion_runtime.clear()
+    result = cli.cmd_enrich(force=change == "force")
+    assert result.enrichment.enriched == 1
+    assert any(role == "enrichment" for role, _ in ingestion_runtime)
+    card = EnrichedCardV2.model_validate_json(card_file.read_text(encoding="utf-8"))
+    if change == "metadata":
+        assert card.provenance.post_url == "https://t.me/revised_source/1"
+
+
+@pytest.mark.parametrize("setting,value", [
+    ("CODEX_LUNA_MODEL", "isolated-future-model"), ("LLM_PROFILE", "current"),
+    ("CODEX_LUNA_REASONING_EFFORT", "isolated-future-effort"),
+])
+def test_published_youtube_generation_survives_model_settings(ingestion_runtime, monkeypatch, setting, value):
+    source_text = config.YOUTUBE_NORMALIZED_DIR / "source.youtube.txt"
+    source_text.write_text((RUSSIAN + " ") * 200, encoding="utf-8")
+    source_text.with_suffix(".meta.json").write_text(json.dumps({
+        "url": "https://www.youtube.com/watch?v=abc123", "video_id": "abc123", "title": "Переговоры",
+        "channel": "Source", "duration_seconds": 1800, "transcript_source": "subtitles",
+        "transcript_path": str(source_text.relative_to(config.PROJECT_ROOT)),
+        "telegram_source": {"channel_name": "Acceptance", "channel_id": 123, "message_id": 1},
+    }), encoding="utf-8")
+    result = cli.cmd_enrich()
+    assert result.enrichment.youtube_episodes == 1
+    assert result.enrichment.youtube_segments > 0
+    files = [*config.ENRICHED_DIR.rglob("*.json"), *config.YOUTUBE_SEGMENTS_DIR.rglob("*.json")]
+    original = {path: path.read_bytes() for path in files}
+    assert any(path.name.endswith("manifest.json") for path in files)
+    ingestion_runtime.clear()
+    monkeypatch.setattr(config, setting, value)
+    monkeypatch.setattr(config, "REGENERATE_ON_PROFILE_CHANGE", True)
+    result = cli.cmd_enrich()
+    assert result.enrichment.youtube_skipped == 1
+    assert ingestion_runtime == []
+    assert all(path.read_bytes() == data for path, data in original.items())

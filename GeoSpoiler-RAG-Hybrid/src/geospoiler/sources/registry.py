@@ -63,7 +63,8 @@ def rebuild_source_registry(
     db_path: Path = config.SOURCE_REGISTRY_DB_PATH,
 ) -> SourceRegistryStats:
     """Rebuild the local source registry from normalized metadata and enriched cards."""
-    run_id = _utc_now()
+    # A resumed or rapid consecutive run can rebuild twice within one second.
+    run_id = datetime.now(UTC).isoformat()
     sources: dict[str, dict[str, str]] = {}
     normalized_rows: list[dict[str, str]] = []
     enriched_rows: list[dict[str, str]] = []

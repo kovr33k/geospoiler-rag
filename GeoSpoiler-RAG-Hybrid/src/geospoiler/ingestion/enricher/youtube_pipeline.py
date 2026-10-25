@@ -1171,11 +1171,7 @@ def _source_fingerprint(source: dict, transcript: str) -> str:
         "schema_version": config.ENRICHMENT_SCHEMA_VERSION,
         "enrichment_prompt_version": config.ENRICHMENT_PROMPT_VERSION,
         "prompt_version": config.YOUTUBE_ENRICHMENT_PROMPT_VERSION,
-        "model": (
-            llm_backend.active_model_for("enrichment")
-            if config.REGENERATE_ON_PROFILE_CHANGE
-            else "profile-independent"
-        ),
+        "model": "profile-independent",
         "merge_max_chars": config.YOUTUBE_MERGE_MAX_CHARS,
         "segmentation_version": config.YOUTUBE_SEGMENTATION_VERSION,
         "segment_threshold_chars": SEGMENT_THRESHOLD_CHARS,

@@ -99,18 +99,12 @@ def active_model_for(role: str) -> str:
 
 
 def model_change_requires_regeneration(previous_model: str, role: str) -> bool:
-    """Respect the profile toggle without hiding same-backend model changes."""
-    if not str(previous_model or "").strip():
-        return True
-    current_model = active_model_for(role)
-    if previous_model == current_model:
-        return False
-    if not config.REGENERATE_ON_PROFILE_CHANGE:
-        previous_is_codex = str(previous_model).startswith(_CODEX_MODEL_PREFIX)
-        current_is_codex = current_model.startswith(_CODEX_MODEL_PREFIX)
-        if previous_is_codex != current_is_codex:
-            return False
-    return True
+    """Missing provenance is invalid; a different model is still valid provenance.
+
+    Keep the compatibility entry point. Source/schema/prompt validity and an
+    explicit force request are checked by the result owners, not model identity.
+    """
+    return not str(previous_model or "").strip()
 
 
 def complete_json_sync(
@@ -331,6 +325,8 @@ async def _run_codex_async(
     prompt: str,
     output_path: Path,
 ) -> str:
+    if os.getenv("GEOSPOILER_NO_NETWORK", "").lower() in {"1", "true", "yes"}:
+        raise LLMBackendError("Codex subprocess calls are disabled in offline mode")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process_kwargs: dict[str, Any] = {
         "stdin": asyncio.subprocess.PIPE,
@@ -442,6 +438,8 @@ async def _run_async_termination_command(command: list[str]) -> None:
 
 
 def _run_codex(command: list[str], prompt: str, output_path: Path, timeout: float) -> str:
+    if os.getenv("GEOSPOILER_NO_NETWORK", "").lower() in {"1", "true", "yes"}:
+        raise LLMBackendError("Codex subprocess calls are disabled in offline mode")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process_kwargs: dict[str, Any] = {
         "stdin": subprocess.PIPE,

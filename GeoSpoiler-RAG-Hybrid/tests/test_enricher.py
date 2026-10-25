@@ -794,7 +794,7 @@ class EnrichedV2BoundaryTests(unittest.TestCase):
             "custom:source:1",
         )
 
-    def test_progress_invalidates_schema_prompt_and_model_changes(self):
+    def test_progress_invalidates_processing_rules_but_preserves_model_provenance(self):
         key = "Channel/1"
         current = {
             "enriched": {
@@ -822,8 +822,9 @@ class EnrichedV2BoundaryTests(unittest.TestCase):
             else:
                 changed["enriched"][key][field] = "old"
             with self.subTest(field=field):
-                self.assertTrue(
-                    enricher_pipeline._needs_enrichment(changed, key, "source-fingerprint")
+                self.assertEqual(
+                    enricher_pipeline._needs_enrichment(changed, key, "source-fingerprint"),
+                    field != "enrichment_model",
                 )
 
         changed_fingerprint = json.loads(json.dumps(current))
@@ -895,6 +896,7 @@ class EnrichedV2BoundaryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             valid_card = EnrichedCardV2(
+                summary="Источник сообщил о переговорах.",
                 schema_version=enricher_pipeline.config.ENRICHMENT_SCHEMA_VERSION,
                 prompt_version=enricher_pipeline.config.ENRICHMENT_PROMPT_VERSION,
                 enrichment_model=enricher_pipeline.llm_backend.active_model_for(

@@ -67,11 +67,11 @@ class LlmBackendTests(unittest.TestCase):
         config.CODEX_LUNA_MODEL = "codex-test-model"
         self.assertTrue(llm_backend.model_change_requires_regeneration("", "enrichment"))
 
-    def test_same_backend_model_change_still_invalidates(self):
+    def test_same_backend_model_change_keeps_valid_provenance(self):
         config.LLM_PROFILE = "luna"
         config.CODEX_LUNA_MODEL = "codex-test-model"
         config.REGENERATE_ON_PROFILE_CHANGE = False
-        self.assertTrue(llm_backend.model_change_requires_regeneration("codex-cli:previous", "enrichment"))
+        self.assertFalse(llm_backend.model_change_requires_regeneration("codex-cli:previous", "enrichment"))
 
     def test_luna_requires_explicit_model(self):
         config.LLM_PROFILE = "luna"
@@ -240,6 +240,7 @@ class LlmBackendTests(unittest.TestCase):
         self.assertEqual(child_env["CODEX_FALLBACK_TO_API"], "false")
         self.assertEqual(child_env["REGENERATE_ON_PROFILE_CHANGE"], "true")
 
+    @patch.dict(os.environ, {"GEOSPOILER_NO_NETWORK": "0"})
     def test_async_codex_runner_terminates_process_on_cancellation(self):
         async def exercise():
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -280,6 +281,7 @@ class LlmBackendTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    @patch.dict(os.environ, {"GEOSPOILER_NO_NETWORK": "0"})
     def test_sync_codex_timeout_invokes_tree_cleanup(self):
         process = Mock()
         process.pid = 12345
@@ -295,6 +297,7 @@ class LlmBackendTests(unittest.TestCase):
 
         terminate.assert_called_once_with(process)
 
+    @patch.dict(os.environ, {"GEOSPOILER_NO_NETWORK": "0"})
     def test_sync_codex_cleanup_preserves_keyboard_interrupt(self):
         process = Mock()
         process.pid = 12345

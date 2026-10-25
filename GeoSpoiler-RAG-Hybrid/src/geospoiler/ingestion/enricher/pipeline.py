@@ -879,6 +879,8 @@ def _needs_enrichment(
     key: str,
     source_fingerprint: str,
 ) -> bool:
+    if key in progress.get("failed", {}):
+        return True
     prev = progress.get("enriched", {}).get(key)
     if prev is None:
         return True
@@ -906,9 +908,11 @@ def _migrate_non_media_contract(
 ) -> bool:
     """Stamp media-contract-v2 without an LLM call when a source has no media.
 
-    All semantic inputs and model identities must already match. A changed
+    All semantic inputs and valid provenance must already match. A changed
     fingerprint or any structural mismatch stays on the normal enrichment path.
     """
+    if key in progress.get("failed", {}):
+        return False
     prev = progress.get("enriched", {}).get(key)
     if not isinstance(prev, dict) or prev.get("source_fingerprint") != source_fingerprint:
         return False
@@ -930,6 +934,8 @@ def _migrate_non_media_contract(
         or llm_backend.model_change_requires_regeneration(card.enrichment_model, "enrichment")
         or not expected_source_id
         or card.provenance.source_id != expected_source_id
+        or "extraction_unstable" in card.quality_flags
+        or not (card.summary.strip() or card.key_points)
     ):
         return False
     if card.media_contract_version != _MEDIA_CONTRACT_VERSION:
@@ -961,6 +967,8 @@ def _is_valid_enriched_output(path: Path, expected_source_id: str | None) -> boo
     if not expected_source_id:
         return False
     if card.provenance.source_id != expected_source_id:
+        return False
+    if "extraction_unstable" in card.quality_flags or not (card.summary.strip() or card.key_points):
         return False
     return True
 
