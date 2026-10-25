@@ -1,7 +1,9 @@
 import logging
 import re
+from functools import lru_cache
 
 import requests
+from lingua import Language, LanguageDetectorBuilder
 
 from geospoiler import config
 from geospoiler.providers import llm_backend
@@ -17,24 +19,17 @@ Preserve all original meaning, entities, quotes, formatting, and tone.
 DO NOT add any conversational filler like 'Here is the translation'. Output ONLY the final Russian text."""
 
 
-_RUSSIAN_SIGNALS = frozenset(
-    "это этот этого этом эти который которая которые чтобы потому сейчас сегодня ещё также "
-    "однако сообщил сообщили заявили русский полностью новые новый нового власти переговоры "
-    "обсуждают будет были было быть после между только через сказал сказали наши нашего "
-    "может можно нужно почему если очень даже вместо".split()
-)
-_OTHER_CYRILLIC_SIGNALS = frozenset(
-    "це що та але проте який яка вони його вона року коли якщо тому також просять "
-    "безпеку угоду нову влада переговори".split()
-)
+@lru_cache(maxsize=1)
+def _russian_detector():
+    return LanguageDetectorBuilder.from_languages(Language.RUSSIAN, Language.UKRAINIAN, Language.BULGARIAN).build()
 
 
 def is_confidently_russian(text: str) -> bool:
     """Conservative local bypass; unknown and mixed prose still reaches translation.
 
-    Require positive Russian word evidence, not just Cyrillic. URLs and short
-    uppercase acronyms do not provide language evidence. Check each sentence so
-    a Russian introduction cannot mask an uncertain or foreign continuation.
+    Require local Russian confidence against Ukrainian/Bulgarian, not just
+    Cyrillic. Check clauses separately so a Russian introduction cannot mask a
+    foreign continuation. Very short and ambiguous fragments retain translation.
     """
     candidate = re.sub(r"https?://\S+|www\.\S+", " ", text)
     candidate = re.sub(
@@ -42,18 +37,21 @@ def is_confidently_russian(text: str) -> bool:
         "", candidate,
     )
     found_prose = False
-    for sentence in re.split(r"[.!?\n]+", candidate):
+    for sentence in re.split(r"[.!?,;:\n]+", candidate):
         words = re.findall(r"[^\W\d_]+", sentence, re.UNICODE)
-        words = [word for word in words if not (word.isascii() and word.isupper() and len(word) <= 5)]
         if not words:
             continue
+        acronyms = [word for word in words if word.isascii() and word.isupper() and len(word) <= 5]
+        if len(acronyms) > 1:
+            return False
+        words = [word for word in words if word not in acronyms]
+        if len(words) < 3:
+            return False
         found_prose = True
         if any(not re.fullmatch(r"[а-яё]+", word.casefold()) for word in words):
             return False
-        vocabulary = {word.casefold() for word in words}
-        if vocabulary & _OTHER_CYRILLIC_SIGNALS:
-            return False
-        if len(vocabulary & _RUSSIAN_SIGNALS) < 2:
+        confidence = _russian_detector().compute_language_confidence_values(" ".join(words))[0]
+        if confidence.language != Language.RUSSIAN or confidence.value < 0.95:
             return False
     return found_prose
 

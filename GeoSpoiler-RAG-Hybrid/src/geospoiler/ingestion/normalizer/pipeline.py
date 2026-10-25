@@ -16,7 +16,7 @@ from geospoiler import config
 from geospoiler.contracts.models import NormalizedMeta
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMedia, TelegramMessage
 from geospoiler.ingestion.normalizer.ai_chat_handler import queue_for_review
-from geospoiler.ingestion.normalizer.atomic_pair import atomic_write_bytes
+from geospoiler.ingestion.normalizer.atomic_pair import atomic_write_bytes, atomic_write_pair, recover_atomic_pair
 from geospoiler.ingestion.normalizer.document_handler import extract_document_text
 from geospoiler.ingestion.normalizer.image_handler import describe_image
 from geospoiler.ingestion.normalizer.instagram_handler import extract_instagram_text
@@ -681,6 +681,13 @@ def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = No
     if metadata is not None:
         metadata = {**metadata, "normalized_text_sha256": hashlib.sha256(text_bytes).hexdigest()}
         metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        meta_path = filepath.with_suffix(".meta.json")
+        recover_atomic_pair(filepath, meta_path, journal_suffix="normalized")
+        if filepath.is_file() and meta_path.is_file():
+            atomic_write_pair(filepath, text_bytes, meta_path, metadata_bytes,
+                              original_first=filepath.read_bytes(), original_second=meta_path.read_bytes(),
+                              journal_suffix="normalized")
+            return filepath
     atomic_write_bytes(filepath, text_bytes)
     # Publish metadata last; its hash detects an interrupted pair overwrite.
     if metadata is not None:
@@ -690,6 +697,7 @@ def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = No
 
 def read_normalized_meta(path: Path) -> NormalizedMeta:
     """Validate saved input readiness, including interrupted pair publication."""
+    recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
     text = path.read_bytes()
     if not text.decode("utf-8").strip():
         raise ValueError(f"Empty normalized text: {path}")

@@ -23,8 +23,8 @@ from geospoiler.ingestion.fetcher import telegram_client as telegram
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMessage
 from geospoiler.ingestion.normalizer import media_vision, transcription_handler
 from geospoiler.ingestion.normalizer import pipeline as normalization
-from geospoiler.ingestion.normalizer.pipeline import _save_normalized
-from geospoiler.ingestion.normalizer.youtube_handler import YouTubeArtifact
+from geospoiler.ingestion.normalizer.pipeline import _save_normalized, read_normalized_meta
+from geospoiler.ingestion.normalizer.youtube_handler import YouTubeArtifact, save_youtube_artifact
 from geospoiler.providers import llm_backend
 from geospoiler.retrieval.cards.card_fts import rebuild_card_index, rebuild_youtube_segment_index, search_card_index
 from geospoiler.retrieval.lightrag.storage import load_source_metadata_index
@@ -98,6 +98,9 @@ def run_messages(monkeypatch, messages):
     ("The ministers discussed a new agreement during negotiations.", 1),
     (RUSSIAN + " The final agreement remains uncertain.", 1),
     (RUSSIAN + " Це нова угода.", 1),
+    ("Сегодня власти сообщили, президент розпочав позачергову нараду стосовно нового закону.", 1),
+    ("Сегодня власти заявили, че няма достатъчно средства.", 1),
+    (RUSSIAN + " STOP THE WAR.", 1),
     ("Москва, НАТО, ООН", 1),
 ])
 def test_run_translation_policy_saves_searchable_card(ingestion_runtime, monkeypatch, text, translation_calls):
@@ -290,7 +293,7 @@ def test_stream_has_bounded_unfinished_inputs(ingestion_runtime, monkeypatch):
 @pytest.mark.parametrize("stage", ["normalization", "enrichment"])
 def test_late_success_does_not_hide_early_failure(ingestion_runtime, monkeypatch, stage):
     real_response = llm_backend.complete_json_sync
-    original_first = "Foreign input" if stage == "normalization" else RUSSIAN.rstrip(".") + ", номер задания 1."
+    original_first = "Foreign input" if stage == "normalization" else RUSSIAN.rstrip(".") + " номер задания 1."
 
     def translate(*args, **kwargs):
         raise RuntimeError("controlled normalization failure")
@@ -337,6 +340,65 @@ def test_incomplete_saved_pair_cannot_publish_card(ingestion_runtime, monkeypatc
     cli.cmd_enrich()
     assert not card.exists()
     assert ingestion_runtime == []
+
+
+def test_interrupted_legacy_pair_overwrite_never_accepts_mixed_provenance(ingestion_runtime, monkeypatch):
+    path = _save_normalized(message(RUSSIAN), "Original text", {"channel_id": 123, "message_id": 1, "date": "2026-01-01"})
+    meta_path = path.with_suffix(".meta.json")
+    old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    old_meta.pop("normalized_text_sha256")
+    meta_path.write_text(json.dumps(old_meta), encoding="utf-8")
+    real_replace = os.replace
+
+    def interrupt(path, target):
+        if Path(target) == meta_path:
+            raise KeyboardInterrupt("controlled interruption before sidecar publication")
+        return real_replace(path, target)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "replace", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            _save_normalized(message(RUSSIAN), "Replacement text", {**old_meta, "date": "2026-10-25"})
+    accepted = read_normalized_meta(path)
+    assert path.read_text(encoding="utf-8") == "Original text"
+    assert accepted.date == "2026-01-01"
+
+
+def test_stream_checkpoint_io_grows_linearly(ingestion_runtime, monkeypatch):
+    reads = []
+    original_read = Path.read_text
+
+    def observe_read(path, *args, **kwargs):
+        if path == state.PROGRESS_FILE:
+            reads.append(path)
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", observe_read)
+    messages = [message(RUSSIAN, index) for index in range(1, 13)]
+    run_messages(monkeypatch, messages)
+    assert len(reads) <= 2 * len(messages) + 1
+    assert state.get_last_message_id(123) == 12
+
+
+def test_stream_prefers_dedicated_youtube_over_same_legacy_occurrence(ingestion_runtime, monkeypatch):
+    url = "https://www.youtube.com/watch?v=abc123"
+    artifact = YouTubeArtifact(url=url, video_id="abc123", title="Переговоры", channel="Source",
+                               duration_seconds=1800, language="ru", transcript_source="subtitles",
+                               transcript_text=(RUSSIAN + " ") * 200, cues=[], description="", chapters=[],
+                               description_links=[], extracted_at="2026-10-25T00:00:00Z")
+    save_youtube_artifact(artifact, channel_name="Acceptance", channel_id=123, message_id=1,
+                          source_meta={"channel_name": "Acceptance", "channel_id": 123, "message_id": 1})
+    legacy_marker = "Устаревшая краткая версия без таймкодов."
+    _save_normalized(message(url), f"[YouTube]\nНазвание: Переговоры\nАвтор: Source\nURL: {url}\n\n{legacy_marker}",
+                     {"channel_name": "Acceptance", "channel_id": 123, "message_id": 1,
+                      "youtube_urls": [url], "has_body_text": False})
+    run_messages(monkeypatch, [message(RUSSIAN, 2)])
+    assert not any(legacy_marker in text for role, text in ingestion_runtime if role == "enrichment")
+    episode = config.ENRICHED_DIR / "123/1.youtube.abc123.enriched.json"
+    manifest = json.loads(episode.with_name(episode.name + ".manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["segment_count"] > 0
+    assert len(list(config.YOUTUBE_SEGMENTS_DIR.rglob("*.youtube-segment.json"))) == manifest["segment_count"]
 
 
 def test_cancelled_run_drains_saved_work_and_resumes(ingestion_runtime, monkeypatch):
@@ -444,6 +506,13 @@ def test_self_contained_caption_skips_download_and_analysis(media_boundaries, mo
     card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
     assert not any("media:" in issue for issue in card.extraction_issues)
     assert search_card_index("переговорах", db_path=config.CARD_FTS_DB_PATH)
+
+
+def test_photo_event_noun_is_not_attachment_dependency(media_boundaries, monkeypatch):
+    transport = run_raw_media(monkeypatch, "photo", "На фотосессии сегодня власти обсуждают новые переговоры.")
+    transport.assert_not_called()
+    vision, _, _ = media_boundaries
+    vision.assert_not_called()
 
 
 @pytest.mark.parametrize("caption", ["", "Смотрите", "🔥"])

@@ -13,7 +13,9 @@ def media_operations(text: str, media_type: str) -> list[str]:
     caption = (text or "").casefold()
     image_reference = re.search(
         r"(?:на|в|із|з|on|in)\s+(?:(?:этом|этой|этих|цьому|цій|the|this)\s+)?"
-        r"(?:скрин\w*|скрін\w*|изображени\w*|зображенн\w*|фото\w*|карт[аеу]\w*|схем\w*|график\w*|screenshot\w*|image\w*|map\w*)",
+        r"(?:скрин(?:шот)?(?:е|ах|у|а|ы|ов|ам|ами|ом)?|скрін(?:шот)?(?:і|ах|у|а|и|ів|ам|ами|ом)?|"
+        r"изображени\w*|зображенн\w*|фото(?:графи(?:я|и|ю|й|ей|ях|ям|ями))?|"
+        r"карт(?:а|е|у|ы|ой|ою|ах|ам|ами)|схем\w*|график\w*|screenshots?|images?|maps?)\b",
         caption,
     )
     recording_reference = re.search(

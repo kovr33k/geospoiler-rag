@@ -398,7 +398,8 @@ def _normalize_into_queue(channel_messages, ready_paths, stop, consumer_done) ->
         for _, messages in channel_messages:
             successes = set()
             marked = 0
-            for msg in sorted(messages, key=lambda item: item.message_id):
+            ordered = sorted(messages, key=lambda item: item.message_id)
+            for msg in ordered:
                 if stop.is_set():
                     return summary
                 result = normalize_batch([msg])
@@ -413,9 +414,11 @@ def _normalize_into_queue(channel_messages, ready_paths, stop, consumer_done) ->
                     if not admit(path):
                         return summary
                     successes.add(msg.message_id)
-                current = _mark_contiguous_processed(messages, successes)
-                summary.processed_messages += current - marked
-                marked = current
+                while marked < len(ordered) and ordered[marked].message_id in successes:
+                    completed = ordered[marked]
+                    mark_message_processed(completed.channel_id, completed.channel_name, completed.message_id)
+                    summary.processed_messages += 1
+                    marked += 1
         return summary
     finally:
         while not consumer_done.is_set():

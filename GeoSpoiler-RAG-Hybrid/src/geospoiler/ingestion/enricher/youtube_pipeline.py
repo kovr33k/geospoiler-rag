@@ -114,25 +114,30 @@ def enrich_youtube_all(
     legacy_meta_paths: list[Path] | None = None,
 ) -> YouTubeEnrichmentStats:
     """Enrich dedicated YouTube artifacts and legacy normalized YouTube posts."""
-    stats = YouTubeEnrichmentStats()
-    seen_keys: set[tuple[str, str]] = set()
     discovery_errors: list[tuple[Path, str]] = []
+    sources = _iter_youtube_sources(channel_filter=channel_filter, metadata_paths=metadata_paths,
+                                    legacy_meta_paths=legacy_meta_paths, seen_keys=set(), discovery_errors=discovery_errors)
+    return _enrich_youtube_sources(sources, force=force, discovery_errors=discovery_errors)
 
-    def iter_sources():
-        for source in _iter_dedicated_sources(channel_filter, discovery_errors, metadata_paths):
-            key = _source_key(source)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                yield source
-        # Existing normalized YouTube posts predate timed artifacts. Read them
-        # as a no-cue fallback so regeneration does not lose the current corpus.
-        for source in _iter_legacy_sources(channel_filter, discovery_errors, legacy_meta_paths):
-            key = _source_key(source)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                yield source
 
-    for source in iter_sources():
+def _iter_youtube_sources(*, channel_filter, metadata_paths, legacy_meta_paths, seen_keys, discovery_errors):
+    for source in _iter_dedicated_sources(channel_filter, discovery_errors, metadata_paths):
+        key = _source_key(source)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            yield source
+    # Keep dedicated-source preference and occurrence identity across the
+    # entire stream, not a separate seen-set inside every worker invocation.
+    for source in _iter_legacy_sources(channel_filter, discovery_errors, legacy_meta_paths):
+        key = _source_key(source)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            yield source
+
+
+def _enrich_youtube_sources(sources, *, force: bool, discovery_errors) -> YouTubeEnrichmentStats:
+    stats = YouTubeEnrichmentStats()
+    for source in sources:
         stats.sources_scanned += 1
         try:
             result = _enrich_source(source, force=force)

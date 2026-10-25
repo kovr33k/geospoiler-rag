@@ -34,6 +34,7 @@ rag_storage_backups/
 rag_storage_failed_rebuild_*/
 
 # Runtime caches and local databases
+artifacts/
 rag_storage/kv_store_llm_response_cache*.json
 artifacts/*.sqlite
 artifacts/*.pid

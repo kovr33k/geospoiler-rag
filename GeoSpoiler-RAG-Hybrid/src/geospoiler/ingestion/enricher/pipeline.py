@@ -47,7 +47,12 @@ from geospoiler.ingestion.enricher.validator import (
     has_required_language_violations,
     validate_payload,
 )
-from geospoiler.ingestion.enricher.youtube_pipeline import _looks_like_legacy_youtube_document, enrich_youtube_all
+from geospoiler.ingestion.enricher.youtube_pipeline import (
+    _enrich_youtube_sources,
+    _iter_youtube_sources,
+    _looks_like_legacy_youtube_document,
+    enrich_youtube_all,
+)
 from geospoiler.ingestion.normalizer.pipeline import read_normalized_meta
 from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_ENRICHMENT_FAILURE, REVIEW_TYPE_UNINFORMATIVE
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
@@ -238,8 +243,18 @@ def _run_ready_enrichment(ready_paths: queue.Queue, progress: dict, stats: Enric
     """One coordinator publishes results while a bounded producer saves inputs."""
     concurrency = _enrichment_concurrency()
     finished = False
+    seen_youtube_keys = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         pending = {}
+
+        def submit_youtube(metadata_paths, legacy_meta_paths):
+            errors = []
+            sources = list(_iter_youtube_sources(channel_filter=None, metadata_paths=metadata_paths,
+                                                 legacy_meta_paths=legacy_meta_paths,
+                                                 seen_keys=seen_youtube_keys, discovery_errors=errors))
+            if sources or errors:
+                pending[executor.submit(_enrich_youtube_sources, sources, force=force, discovery_errors=errors)] = None
+
         while not finished or pending:
             for future in list(pending):
                 if not future.done():
@@ -269,8 +284,7 @@ def _run_ready_enrichment(ready_paths: queue.Queue, progress: dict, stats: Enric
                 finished = True
                 continue
             if path.name.endswith(".youtube.meta.json"):
-                future = executor.submit(enrich_youtube_all, force=force, metadata_paths=[path], legacy_meta_paths=[])
-                pending[future] = None
+                submit_youtube([path], [])
                 continue
             skipped_youtube = stats.skipped_youtube
             jobs = _collect_enrichment_jobs(progress=progress, channel_filter=None, force=force,
@@ -280,9 +294,7 @@ def _run_ready_enrichment(ready_paths: queue.Queue, progress: dict, stats: Enric
             if stats.skipped_youtube > skipped_youtube:
                 meta = read_normalized_meta(path)
                 if not (meta.model_extra or {}).get("youtube_sources"):
-                    future = executor.submit(enrich_youtube_all, force=force, metadata_paths=[],
-                                             legacy_meta_paths=[path.with_suffix(".meta.json")])
-                    pending[future] = None
+                    submit_youtube([], [path.with_suffix(".meta.json")])
 
 
 def _add_youtube_stats(stats: EnrichmentStats, youtube_stats) -> None:

@@ -22,7 +22,7 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:WIKI_ENABLED = "false"
 $env:HYBRID_QUERY_WIKI_ENABLED = "false"
-$env:PYTHONPATH = "$projectRoot$([IO.Path]::PathSeparator)$(Join-Path $projectRoot 'src')"
+$env:PYTHONPATH = "$projectRoot$([IO.Path]::PathSeparator)$(Join-Path $projectRoot 'src')$([IO.Path]::PathSeparator)$env:PYTHONPATH"
 if (-not $env:TIKTOKEN_CACHE_DIR) {
     $cacheRoot = if ($IsWindows) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
     $env:TIKTOKEN_CACHE_DIR = Join-Path $cacheRoot "GeoSpoiler/tiktoken"

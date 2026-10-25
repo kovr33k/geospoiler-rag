@@ -9,6 +9,10 @@ sidecar is published last. Enrichment verifies the digest before admission and
 again before processing, so an interrupted overwrite cannot pair new text with
 old metadata. Existing sidecars without this additive field retain their schema
 validation path. A missing, empty or mismatched pair cannot publish a new card.
+Overwriting an existing pair uses the established durable rollback journal,
+including for legacy sidecars without a digest. Readers recover an interrupted
+publication before validating input, preserving either the old complete pair
+or the newly committed pair.
 
 Selective-media sidecars retain `attachment_id`, media type, message ID and post
 URL. Code owns `analysis_operations`, `selection_reason` and `analysis_status`:
