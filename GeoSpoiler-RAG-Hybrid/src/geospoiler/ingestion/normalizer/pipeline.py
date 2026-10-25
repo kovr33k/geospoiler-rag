@@ -16,6 +16,7 @@ from geospoiler import config
 from geospoiler.contracts.models import NormalizedMeta
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMedia, TelegramMessage
 from geospoiler.ingestion.normalizer.ai_chat_handler import queue_for_review
+from geospoiler.ingestion.normalizer.atomic_pair import atomic_write_bytes
 from geospoiler.ingestion.normalizer.image_handler import describe_image
 from geospoiler.ingestion.normalizer.instagram_handler import extract_instagram_text
 from geospoiler.ingestion.normalizer.media_paths import portable_media_path, portable_project_path
@@ -623,22 +624,14 @@ def _get_filepath(msg: TelegramMessage) -> Path:
 def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = None) -> Path:
     """Save normalized text plus sidecar metadata to files."""
     filepath = _get_filepath(msg)
-    text_tmp = filepath.with_name(f".{filepath.name}.tmp")
-    text_tmp.write_bytes(text.encode("utf-8"))
+    text_bytes = text.encode("utf-8")
     if metadata is not None:
-        meta_path = filepath.with_suffix(".meta.json")
-        meta_tmp = meta_path.with_name(f".{meta_path.name}.tmp")
-        metadata = {**metadata, "normalized_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
-        meta_tmp.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        text_tmp.replace(filepath)
-        # Publishing metadata last marks a complete text/sidecar pair. The hash
-        # detects an interrupted overwrite that retained the previous sidecar.
-        meta_tmp.replace(meta_path)
-    else:
-        text_tmp.replace(filepath)
+        metadata = {**metadata, "normalized_text_sha256": hashlib.sha256(text_bytes).hexdigest()}
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+    atomic_write_bytes(filepath, text_bytes)
+    # Publish metadata last; its hash detects an interrupted pair overwrite.
+    if metadata is not None:
+        atomic_write_bytes(filepath.with_suffix(".meta.json"), metadata_bytes)
     return filepath
 
 

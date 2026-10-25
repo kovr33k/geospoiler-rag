@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -215,7 +216,7 @@ def test_first_card_persists_while_next_normalization_is_blocked(ingestion_runti
                                    description_links=[], extracted_at="2026-10-25T00:00:00Z")
         monkeypatch.setattr(normalization, "extract_youtube_artifact", lambda _: artifact)
         first_card = config.ENRICHED_DIR / "123/1.youtube.abc123.enriched.json"
-    real_replace = Path.replace
+    real_replace = os.replace
 
     def observe_replace(path, target):
         result = real_replace(path, target)
@@ -230,7 +231,7 @@ def test_first_card_persists_while_next_normalization_is_blocked(ingestion_runti
         assert release.wait(5)
         return RUSSIAN
 
-    monkeypatch.setattr(Path, "replace", observe_replace)
+    monkeypatch.setattr(os, "replace", observe_replace)
     monkeypatch.setattr(llm_backend, "complete_text_sync", translate)
     with ThreadPoolExecutor(max_workers=1) as executor:
         run = executor.submit(run_messages, monkeypatch, [first_message, message("Foreign continuation", 2)])
@@ -249,7 +250,7 @@ def test_stream_has_bounded_unfinished_inputs(ingestion_runtime, monkeypatch):
     release = threading.Event()
     capacity_reached = threading.Event()
     normalized = []
-    real_replace = Path.replace
+    real_replace = os.replace
     real_response = llm_backend.complete_json_sync
     bound = 2 * config.ENRICHMENT_CONCURRENCY + 1
 
@@ -265,7 +266,7 @@ def test_stream_has_bounded_unfinished_inputs(ingestion_runtime, monkeypatch):
         assert release.wait(5)
         return real_response(*args, **kwargs)
 
-    monkeypatch.setattr(Path, "replace", observe_replace)
+    monkeypatch.setattr(os, "replace", observe_replace)
     monkeypatch.setattr(llm_backend, "complete_json_sync", extract)
     messages = [message(RUSSIAN, index) for index in range(1, 17)]
     with ThreadPoolExecutor(max_workers=1) as executor:
