@@ -1,4 +1,5 @@
 import logging
+import re
 
 import requests
 
@@ -16,12 +17,51 @@ Preserve all original meaning, entities, quotes, formatting, and tone.
 DO NOT add any conversational filler like 'Here is the translation'. Output ONLY the final Russian text."""
 
 
+_RUSSIAN_SIGNALS = frozenset(
+    "это этот этого этом эти который которая которые чтобы потому сейчас сегодня ещё также "
+    "однако сообщил сообщили заявили русский полностью новые новый нового власти переговоры "
+    "обсуждают будет были было быть после между только через сказал сказали наши нашего "
+    "может можно нужно почему если очень даже вместо".split()
+)
+_OTHER_CYRILLIC_SIGNALS = frozenset(
+    "це що та але проте який яка вони його вона року коли якщо тому також просять "
+    "безпеку угоду нову влада переговори".split()
+)
+
+
+def is_confidently_russian(text: str) -> bool:
+    """Conservative local bypass; unknown and mixed prose still reaches translation.
+
+    Require positive Russian word evidence, not just Cyrillic. URLs and short
+    uppercase acronyms do not provide language evidence. Check each sentence so
+    a Russian introduction cannot mask an uncertain or foreign continuation.
+    """
+    candidate = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    found_prose = False
+    for sentence in re.split(r"[.!?\n]+", candidate):
+        words = re.findall(r"[^\W\d_]+", sentence, re.UNICODE)
+        words = [word for word in words if not (word.isascii() and word.isupper() and len(word) <= 5)]
+        if not words:
+            continue
+        found_prose = True
+        if any(not re.fullmatch(r"[а-яё]+", word.casefold()) for word in words):
+            return False
+        vocabulary = {word.casefold() for word in words}
+        if vocabulary & _OTHER_CYRILLIC_SIGNALS:
+            return False
+        if len(vocabulary & _RUSSIAN_SIGNALS) < 2:
+            return False
+    return found_prose
+
+
 def translate_to_russian_if_needed(text: str) -> str:
     """
     Translates the text to Russian using the configured LLM,
     or leaves it unchanged if it is already in Russian.
     """
     if not text or not text.strip():
+        return text
+    if is_confidently_russian(text):
         return text
 
     messages = [
