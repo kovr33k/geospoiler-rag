@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from geospoiler import config
+from geospoiler.cli import app
 from geospoiler.cli import pipeline as cli
 from geospoiler.contracts.models import EnrichedCardV2
 from geospoiler.ingestion.enricher import pipeline as enrichment
@@ -26,6 +27,7 @@ from geospoiler.ingestion.normalizer.pipeline import _save_normalized
 from geospoiler.ingestion.normalizer.youtube_handler import YouTubeArtifact
 from geospoiler.providers import llm_backend
 from geospoiler.retrieval.cards.card_fts import rebuild_card_index, rebuild_youtube_segment_index, search_card_index
+from geospoiler.retrieval.lightrag.storage import load_source_metadata_index
 from geospoiler.sources.registry import rebuild_source_registry, resolve_source
 
 RUSSIAN = "Сегодня власти сообщили, что новые переговоры состоятся после встречи министров."
@@ -41,6 +43,7 @@ def ingestion_runtime(tmp_path, monkeypatch):
         "REVIEW_QUEUE_DIR": "data/review", "MEDIA_CACHE_DIR": "data/media",
         "TRANSCRIPTION_DIR": "data/transcripts", "MEDIA_VISUAL_DIR": "data/visuals",
         "CARD_FTS_DB_PATH": "indexes/cards.sqlite", "SOURCE_REGISTRY_DB_PATH": "indexes/sources.sqlite",
+        "RAG_STORAGE_DIR": "indexes/lightrag",
     }.items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -540,3 +543,96 @@ def test_selected_pdf_extracts_actual_text_without_vision(media_boundaries, monk
     card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
     assert marker in card.search_text
     assert not card.extraction_issues
+
+
+class ObservedLightRAG:
+    """External graph boundary with persisted status/content and operation receipts."""
+
+    def __init__(self):
+        self.statuses = {}
+        self.documents = {}
+        self.insertions = []
+        self.deletions = []
+
+        async def status(doc_id):
+            return self.statuses.get(doc_id)
+
+        async def content(doc_id):
+            return self.documents.get(doc_id)
+
+        self.doc_status = SimpleNamespace(get_by_id=status)
+        self.full_docs = SimpleNamespace(get_by_id=content)
+
+    async def ainsert(self, texts, ids, file_paths):
+        for text, doc_id, file_path in zip(texts, ids, file_paths, strict=True):
+            self.insertions.append((doc_id, text, file_path))
+            self.statuses[doc_id] = {"status": "processed", "file_path": file_path}
+            self.documents[doc_id] = {"content": text}
+
+    async def adelete_by_doc_id(self, doc_id):
+        self.deletions.append(doc_id)
+        self.statuses.pop(doc_id, None)
+        self.documents.pop(doc_id, None)
+        return SimpleNamespace(status="success", message="deleted")
+
+    async def finalize_storages(self):
+        pass
+
+
+def test_explicit_load_adds_updates_reuses_retries_and_preserves_absent_cards(ingestion_runtime, monkeypatch):
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    rag = ObservedLightRAG()
+    monkeypatch.setattr(cli, "create_rag", AsyncMock(return_value=rag))
+    asyncio.run(cli.cmd_load())
+    assert len(rag.insertions) == 1
+    original_id = rag.insertions[0][0]
+    asyncio.run(cli.cmd_load())
+    assert len(rag.insertions) == 1 and not rag.deletions
+
+    # Save a second real card without implicitly loading it into the graph.
+    before = len(rag.insertions)
+    run_messages(monkeypatch, [message(RUSSIAN, 2)])
+    assert len(rag.insertions) == before
+    asyncio.run(cli.cmd_load())
+    assert len(rag.insertions) == before + 1
+    second_id = rag.insertions[-1][0]
+    assert second_id != original_id
+
+    # Metadata-only updates still reach the graph's source metadata index.
+    meta_path = config.NORMALIZED_DIR / "Acceptance/1.meta.json"
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    metadata["post_url"] = "https://t.me/revised_source/1"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+    asyncio.run(cli.cmd_load())
+    assert len(rag.insertions) == 2 and not rag.deletions
+    assert any(item.get("post_url") == metadata["post_url"] for item in load_source_metadata_index().values())
+
+    card_path = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
+    card = json.loads(card_path.read_text(encoding="utf-8"))
+    card["graph_text"] += "\nИсточник сообщил новые сведения о поставках."
+    card_path.write_text(json.dumps(card), encoding="utf-8")
+    asyncio.run(cli.cmd_load())
+    assert rag.deletions == [original_id]
+    assert [row[0] for row in rag.insertions] == [original_id, second_id, original_id]
+
+    for status in ("failed", "processing"):
+        rag.statuses[original_id]["status"] = status
+        before = len(rag.insertions)
+        asyncio.run(cli.cmd_load())
+        assert len(rag.insertions) == before + 1
+        assert rag.insertions[-1][0] == original_id
+    rag.documents.pop(original_id)
+    before = len(rag.insertions)
+    asyncio.run(cli.cmd_load())
+    assert len(rag.insertions) == before + 1
+
+    (config.ENRICHED_DIR / "Acceptance/2.enriched.json").unlink()
+    before = len(rag.deletions)
+    asyncio.run(cli.cmd_load())
+    assert len(rag.deletions) == before
+    assert second_id in rag.statuses
+
+    before = len(rag.insertions)
+    app.main(["load", "--force"])
+    assert len(rag.insertions) == before + 1
+    assert rag.insertions[-1][0] == original_id

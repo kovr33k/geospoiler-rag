@@ -358,7 +358,7 @@ async def _existing_processed_matches(
     source_path: str,
     text: str,
 ) -> bool:
-    """Verify an already processed document before reusing it in a manifest load."""
+    """Verify processed status and prepared content before any reuse."""
     canonical_path = _canonical_source_path(source_path)
     doc_id = _source_doc_id(canonical_path)
     status_doc = await rag.doc_status.get_by_id(doc_id)
@@ -571,7 +571,9 @@ async def load_from_directory(rag: LightRAG, directory: Path | None = None) -> i
     return await load_texts(rag, texts_with_paths)
 
 
-async def load_from_enriched(rag: LightRAG, enriched_dir: Path | None = None) -> int:
+async def load_from_enriched(
+    rag: LightRAG, enriched_dir: Path | None = None, *, reuse_processed: bool = True,
+) -> int:
     """
     Load graph_text from enriched cards into LightRAG.
 
@@ -638,7 +640,7 @@ async def load_from_enriched(rag: LightRAG, enriched_dir: Path | None = None) ->
         logger.info("  Skipped %d enriched_v2 card(s) without graph_text", skipped_no_graph_text)
 
     logger.info(f"Found {len(texts_with_paths)} enriched texts to load into LightRAG.")
-    return await load_texts(rag, texts_with_paths)
+    return await load_texts(rag, texts_with_paths, reuse_processed=reuse_processed)
 
 
 async def load_from_manifest(

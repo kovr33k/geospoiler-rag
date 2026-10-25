@@ -381,6 +381,14 @@ python scripts/late_fusion_ab.py --output-dir .\artifacts\late_fusion_ab --score
 
 ## When To Use `rebuild`
 
+Ordinary explicit `load` is incremental: matching successfully processed graph
+documents are reused, new documents are inserted and changed/incomplete/failed
+documents are retried with the same logical source identity. Source metadata is
+refreshed even on reuse. `load --force` explicitly reprocesses matching documents,
+including after extraction-rule changes. Missing local cards do not delete graph
+documents. Reported load totals count documents available after insertion/reuse;
+they do not imply that every document required a new extraction.
+
 `rebuild` is not for normal day-to-day runs. Use it only when you want to recreate LightRAG from current enriched v2 cards.
 
 Run:

@@ -72,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument(
         "--reuse-processed",
         action="store_true",
-        help="Reuse only processed graph documents whose stored graph_text matches the manifest",
+        help="Reuse matching processed documents (the default; retained for compatibility)",
     )
+    load.add_argument("--force", action="store_true", help="Reprocess graph documents even when processed content matches")
     load.add_argument(
         "--allow-legacy-manifest",
         action="store_true",
@@ -254,10 +255,12 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             load_stats = asyncio.run(
                 cmd_load(
                     manifest_path=args.load_manifest,
-                    reuse_processed=args.reuse_processed,
+                    reuse_processed=not args.force,
                     allow_legacy_manifest=args.allow_legacy_manifest,
                 )
             )
+        elif args.force:
+            load_stats = asyncio.run(cmd_load(reuse_processed=False))
         else:
             # Preserve the zero-argument call contract for existing integrations.
             load_stats = asyncio.run(cmd_load())

@@ -145,7 +145,7 @@ async def cmd_normalize(channel_messages: list[tuple[str, list[TelegramMessage]]
 async def cmd_load(
     manifest_path: str | None = None,
     *,
-    reuse_processed: bool = False,
+    reuse_processed: bool = True,
     allow_legacy_manifest: bool = False,
 ) -> LoadStats:
     """Explicitly load enriched_v2 graph_text into LightRAG."""
@@ -174,7 +174,10 @@ async def cmd_load(
             load_stats.enriched_cards_seen = sum(
                 1 for _ in config.ENRICHED_DIR.rglob("*.enriched.json")
             )
-            load_stats.graph_texts_loaded = await load_from_enriched(rag)
+            if reuse_processed:
+                load_stats.graph_texts_loaded = await load_from_enriched(rag)
+            else:
+                load_stats.graph_texts_loaded = await load_from_enriched(rag, reuse_processed=False)
 
         merges = await auto_fix_safe_entity_merges(rag)
         if merges:
