@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -17,7 +18,9 @@ from geospoiler.cli import pipeline as cli
 from geospoiler.contracts.models import EnrichedCardV2
 from geospoiler.ingestion.enricher import pipeline as enrichment
 from geospoiler.ingestion.fetcher import state
+from geospoiler.ingestion.fetcher import telegram_client as telegram
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMessage
+from geospoiler.ingestion.normalizer import media_vision, transcription_handler
 from geospoiler.ingestion.normalizer import pipeline as normalization
 from geospoiler.ingestion.normalizer.pipeline import _save_normalized
 from geospoiler.ingestion.normalizer.youtube_handler import YouTubeArtifact
@@ -366,3 +369,174 @@ def test_cancelled_run_drains_saved_work_and_resumes(ingestion_runtime, monkeypa
     run_messages(monkeypatch, messages)
     assert len(list(config.ENRICHED_DIR.rglob("*.enriched.json"))) == len(messages)
     assert all(path.read_bytes() == data for path, data in retained.items())
+
+
+def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=None):
+    """Control Telegram transport while retaining real fetch/group/media routing."""
+    mime = {"photo": "image/jpeg", "image_document": "image/png", "video": "video/mp4",
+            "audio": "audio/mpeg", "voice": "audio/ogg", "document": "text/plain", "pdf": "application/pdf"}[kind]
+    attachment = SimpleNamespace(id=456, mime_type=mime, size=24,
+                                 attributes=[SimpleNamespace(voice=kind == "voice")])
+    media = telegram.MessageMediaPhoto(photo=attachment) if kind == "photo" else telegram.MessageMediaDocument(document=attachment)
+
+    async def download(file):
+        if download_error:
+            raise OSError("controlled Telegram download failure")
+        path = Path(file).with_suffix({"photo": ".jpg", "image_document": ".png", "document": ".txt", "pdf": ".pdf"}.get(kind, ".bin"))
+        path.write_bytes(payload if payload is not None else (b"controlled media" if kind not in {"document", "pdf"} else "Маршрут поставок проходит через порт.".encode()))
+        return str(path)
+
+    transport = AsyncMock(side_effect=download)
+    raw = SimpleNamespace(id=1, date=datetime(2026, 10, 25, tzinfo=UTC), message=caption,
+                          action=None, forward=None, media=media, grouped_id=None, download_media=transport)
+
+    async def iterate(*args, **kwargs):
+        yield raw
+
+    fetcher = telegram.TelegramFetcher.__new__(telegram.TelegramFetcher)
+    fetcher.client = SimpleNamespace(start=AsyncMock(), disconnect=AsyncMock(), iter_messages=iterate)
+    fetcher.discover_channels = AsyncMock(return_value=[{"id": 123, "title": "Acceptance", "name": "acceptance"}])
+    monkeypatch.setattr(cli, "TelegramFetcher", Mock(return_value=fetcher))
+    asyncio.run(cli.cmd_run())
+    return transport
+
+
+@pytest.fixture
+def media_boundaries(ingestion_runtime, monkeypatch):
+    monkeypatch.setattr(config, "MEDIA_PROCESSING_MODE", "selective")
+    monkeypatch.setattr(config, "MEDIA_CAPTURE_ENABLED", True)
+    monkeypatch.setattr(config, "TRANSCRIPTION_ENABLED", True)
+    monkeypatch.setattr(config, "TRANSCRIPTION_API_KEY", "offline-test-key")
+    marker = "Маршрут поставок проходит через порт."
+    vision = Mock(return_value=marker)
+    audio = Mock(return_value=SimpleNamespace(ok=True, status_code=200,
+                 json=lambda: {"choices": [{"message": {"content": marker}}]}))
+    monkeypatch.setattr(llm_backend, "complete_media_analysis_sync", vision)
+    monkeypatch.setattr(transcription_handler.requests, "post", audio)
+    monkeypatch.setattr(llm_backend, "complete_text_sync", lambda messages, **kwargs: messages[-1]["content"].replace("The route crosses the port.", marker))
+    original_json = llm_backend.complete_json_sync
+
+    def extract(messages, **kwargs):
+        result = original_json(messages, **kwargs)
+        if marker in messages[-1]["content"]:
+            result["summary"] = marker
+        return result
+
+    monkeypatch.setattr(llm_backend, "complete_json_sync", extract)
+    return vision, audio, marker
+
+
+@pytest.mark.parametrize("kind", ["photo", "image_document", "video", "audio", "voice", "document", "pdf"])
+def test_self_contained_caption_skips_download_and_analysis(media_boundaries, monkeypatch, kind):
+    transport = run_raw_media(monkeypatch, kind, RUSSIAN)
+    transport.assert_not_called()
+    vision, audio, _ = media_boundaries
+    vision.assert_not_called()
+    audio.assert_not_called()
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    item = meta["media"][0]
+    assert item["attachment_id"] == "456"
+    assert item["analysis_status"] == "not_analyzed"
+    assert item["error"] == ""
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+    assert not any("media:" in issue for issue in card.extraction_issues)
+    assert search_card_index("переговорах", db_path=config.CARD_FTS_DB_PATH)
+
+
+@pytest.mark.parametrize("caption", ["", "Смотрите", "🔥"])
+def test_media_only_or_vague_caption_retains_unanalyzed_source(media_boundaries, monkeypatch, caption):
+    transport = run_raw_media(monkeypatch, "photo", caption)
+    transport.assert_not_called()
+    vision, audio, _ = media_boundaries
+    vision.assert_not_called()
+    audio.assert_not_called()
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    assert meta["post_url"] == "https://t.me/acceptance/1"
+    assert meta["media"][0]["analysis_status"] == "not_analyzed"
+    assert resolve_source("telegram:123:1", db_path=config.SOURCE_REGISTRY_DB_PATH)
+
+
+@pytest.mark.parametrize(("kind", "caption", "vision_count", "audio_count"), [
+    ("photo", "На скриншоте приведены данные о маршруте поставок.", 1, 0),
+    ("image_document", "На карте показан маршрут поставок.", 1, 0),
+    ("voice", "В записи министр говорит о маршруте поставок.", 0, 1),
+    ("audio", "Послушайте эту запись: министр рассказал о поставках.", 0, 1),
+    ("document", "В документе указаны подробности маршрута поставок.", 0, 0),
+])
+def test_explicit_attachment_dependency_reaches_card_and_search(media_boundaries, monkeypatch, kind, caption, vision_count, audio_count):
+    transport = run_raw_media(monkeypatch, kind, caption)
+    transport.assert_awaited_once()
+    vision, audio, marker = media_boundaries
+    assert vision.call_count == vision_count
+    assert audio.call_count == audio_count
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    assert meta["media"][0]["analysis_status"] == "success"
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+    assert marker in card.search_text
+    assert not card.extraction_issues
+    assert search_card_index("порт", db_path=config.CARD_FTS_DB_PATH)
+
+
+@pytest.mark.parametrize("failure", ["download", "analysis"])
+def test_requested_media_failure_is_distinct_from_policy_skip(media_boundaries, monkeypatch, failure):
+    vision, _, _ = media_boundaries
+    if failure == "analysis":
+        vision.side_effect = llm_backend.LLMBackendError("controlled analysis failure")
+    run_raw_media(monkeypatch, "photo", "На скриншоте приведены данные о маршруте поставок.", download_error=failure == "download")
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    assert meta["media"][0]["analysis_status"] == "failed"
+    assert meta["media"][0]["error"] or meta["media"][0].get("visual_error")
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+    assert card.extraction_issues
+
+
+@pytest.mark.parametrize("operation", ["vision", "transcribe"])
+def test_video_dependency_runs_only_required_operation(media_boundaries, monkeypatch, operation):
+    from PIL import Image
+
+    frame = config.MEDIA_CACHE_DIR / "frame.png"
+    image = Image.new("RGB", (64, 64))
+    image.putdata([(255, 255, 255) if (x // 4 + y // 4) % 2 else (0, 0, 0) for y in range(64) for x in range(64)])
+    image.save(frame)
+    frames = Mock(return_value=[frame])
+    monkeypatch.setattr(media_vision, "_extract_frames", frames)
+
+    def convert(command, **kwargs):
+        Path(command[-1]).write_bytes(b"controlled converted audio")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(transcription_handler.subprocess, "run", convert)
+    caption = "На видео видно карту маршрута поставок." if operation == "vision" else "В видео министр говорит о маршруте поставок."
+    transport = run_raw_media(monkeypatch, "video", caption)
+    transport.assert_awaited_once()
+    vision, audio, marker = media_boundaries
+    assert vision.call_count == (operation == "vision")
+    assert audio.call_count == (operation == "transcribe")
+    assert frames.call_count == (operation == "vision")
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+    assert marker in card.search_text
+    assert not card.extraction_issues
+
+
+def test_selected_pdf_extracts_actual_text_without_vision(media_boundaries, monkeypatch):
+    # A tiny real PDF fixture, with a text stream and standard Helvetica font.
+    stream = b"BT /F1 12 Tf 20 100 Td (The route crosses the port.) Tj ET"
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+               b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    pdf = b"%PDF-1.4\n"
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf += f"{index} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref = len(pdf)
+    pdf += b"xref\n0 6\n0000000000 65535 f \n" + b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:])
+    pdf += f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    run_raw_media(monkeypatch, "pdf", "В документе указаны подробности маршрута поставок.", payload=pdf)
+    vision, audio, marker = media_boundaries
+    vision.assert_not_called()
+    audio.assert_not_called()
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+    assert marker in card.search_text
+    assert not card.extraction_issues

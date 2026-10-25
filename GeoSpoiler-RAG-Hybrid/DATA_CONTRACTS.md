@@ -10,6 +10,13 @@ again before processing, so an interrupted overwrite cannot pair new text with
 old metadata. Existing sidecars without this additive field retain their schema
 validation path. A missing, empty or mismatched pair cannot publish a new card.
 
+Selective-media sidecars retain `attachment_id`, media type, message ID and post
+URL. Code owns `analysis_operations`, `selection_reason` and `analysis_status`:
+`not_analyzed` is a policy decision, while `success` and `failed` describe selected
+operations. Existing download/transcription/visual statuses and error diagnostics
+remain available. Unselected operations do not generate missing-analysis errors
+or claims that unseen media is unimportant.
+
 ## Modules
 
 - `src/geospoiler/contracts/models.py` — Pydantic models: `LLMPayload`, `EnrichedCardV2`, `NormalizedMeta`

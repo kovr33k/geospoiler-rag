@@ -37,6 +37,10 @@ def is_confidently_russian(text: str) -> bool:
     a Russian introduction cannot mask an uncertain or foreign continuation.
     """
     candidate = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    candidate = re.sub(
+        r"(?m)^\[(?:(?:Изображение|Видео|Аудио|Документ):[^\n]*|Изображение|Текст с экрана \(OCR\)|Текст документа|(?:Video |Voice )?[Tt]ranscript[^\n]*)\]\s*$",
+        "", candidate,
+    )
     found_prose = False
     for sentence in re.split(r"[.!?\n]+", candidate):
         words = re.findall(r"[^\W\d_]+", sentence, re.UNICODE)

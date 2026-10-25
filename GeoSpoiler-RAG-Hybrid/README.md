@@ -192,12 +192,26 @@ command.
 
 ### Media and model boundaries
 
+`MEDIA_PROCESSING_MODE=selective` is the default for new ingestion. Caption rules
+choose operations before Telegram downloads, including photos and image documents.
+Self-contained text and vague/media-only posts retain attachment identity and an
+explicit `not_analyzed` status without downloading or analyzing the attachment.
+Explicit dependencies select image analysis, video frames, speech transcription,
+or local text/PDF extraction as needed. `all` is an explicit operator override.
+No per-post classifier model is added.
+
+Information only inside skipped media is absent from text search. Source links
+do not guarantee future availability; caption rules can miss important media.
+Local PDF extraction reads existing text; image-only/scanned documents without a
+text layer retain a diagnostic and require review. A policy skip is distinct
+from an error in selected processing. Query-time media analysis is not added.
+
 Text enrichment and final synthesis use Luna through the authenticated Codex
 CLI. Audio remains on Gemini with the configured Whisper fallback. Native image
 and video visual analysis uses the Luna media backend; it stores a status and a
-model/input-identity artifact in the normalized sidecar. A missing audio or
-visual branch is recorded as an explicit review condition and is never silently
-accepted as a caption-only success.
+model/input-identity artifact in the normalized sidecar. A failed selected
+operation retains diagnostics and is never presented as successful media
+extraction. Unselected operations remain explicitly unanalyzed.
 
 Instagram extraction checks the local `yt-dlp` against `YTDLP_MIN_VERSION`.
 Ordinary normalization can continue with a `degraded` latest-version check when

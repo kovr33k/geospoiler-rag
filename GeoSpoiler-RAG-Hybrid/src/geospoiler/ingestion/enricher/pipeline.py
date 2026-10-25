@@ -546,6 +546,9 @@ def _media_quality_flags(meta: NormalizedMeta) -> list[str]:
     """Return deterministic quality flags from native media metadata."""
     flags: list[str] = []
     for item in _media_entries(meta):
+        operations = item.get("analysis_operations")
+        if operations is not None and "transcribe" not in operations:
+            continue
         media_type = str(item.get("media_type") or "").strip().lower()
         if media_type not in {"video", "audio", "voice"}:
             continue
@@ -562,25 +565,30 @@ def _media_quality_issues(meta: NormalizedMeta) -> list[str]:
     """Return compact, non-secret media diagnostics for card provenance."""
     issues: list[str] = []
     for item in _media_entries(meta):
+        operations = item.get("analysis_operations")
+        if operations == []:
+            continue
         media_type = str(item.get("media_type") or "").strip().lower()
         message_id = str(item.get("message_id") or "unknown")
-        if media_type not in {"video", "audio", "voice", "image"}:
+        if media_type not in {"video", "audio", "voice", "image", "document"}:
             continue
         download_status = str(item.get("download_status") or "").strip().lower()
         if download_status and download_status != "downloaded":
             issues.append(f"media:{media_type}:{message_id}:download_{download_status}")
-        if media_type in {"video", "audio", "voice"} and download_status == "downloaded":
+        if media_type in {"video", "audio", "voice"} and download_status == "downloaded" and (operations is None or "transcribe" in operations):
             status = str(item.get("transcription_status") or "").strip().lower()
             if status not in {"transcribed", "no_speech"}:
                 issues.append(
                     f"media:{media_type}:{message_id}:transcription_{status or 'missing'}"
                 )
-        if media_type in {"image", "video"} and download_status == "downloaded":
+        if media_type in {"image", "video"} and download_status == "downloaded" and (operations is None or "vision" in operations):
             visual_status = str(item.get("visual_status") or "").strip().lower()
             if visual_status not in {"success", "unavailable"}:
                 issues.append(
                     f"media:{media_type}:{message_id}:visual_{visual_status or 'missing'}"
                 )
+        if media_type == "document" and item.get("text_extraction_status") != "success":
+            issues.append(f"media:document:{message_id}:text_{item.get('text_extraction_status') or 'missing'}")
     return issues
 
 

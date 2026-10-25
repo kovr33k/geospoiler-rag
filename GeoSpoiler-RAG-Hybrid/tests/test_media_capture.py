@@ -22,6 +22,7 @@ from normalizer.media_vision import VisualExtractionResult  # noqa: E402
 from normalizer.transcription_handler import TranscriptionResult  # noqa: E402
 
 
+@patch.object(pipeline.config, "MEDIA_PROCESSING_MODE", "all")
 class MediaCaptureTests(unittest.TestCase):
     def test_document_media_type_detects_video_audio_and_voice(self):
         self.assertEqual(

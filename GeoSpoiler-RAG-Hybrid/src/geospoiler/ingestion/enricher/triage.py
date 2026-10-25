@@ -21,7 +21,7 @@ TRIAGE_LOW_VALUE = "low-value"  # Legacy value: no new cards should use it.
 
 # Normalized markers that indicate placeholder-only content
 _PLACEHOLDER_RE = re.compile(
-    r"^\[(?:Видео:|Аудио:|AI-диалог:|Отправлено в очередь|Уже обработано:|Веб-страница:.*ошибка).*\]$",
+    r"^\[(?:Видео:|Аудио:|Изображение:|Документ:|AI-диалог:|Отправлено в очередь|Уже обработано:|Веб-страница:.*ошибка).*\]$",
     re.IGNORECASE,
 )
 _HEADER_RE = re.compile(r"^\[Канал:.*\]\s*$")

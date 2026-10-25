@@ -235,6 +235,9 @@ STATE_DIR = PROJECT_ROOT / os.getenv("STATE_DIR", "./state")
 CODEX_RUNTIME_DIR = PROJECT_ROOT / os.getenv("CODEX_RUNTIME_DIR", "./state/codex_runtime")
 YOUTUBE_CHECKPOINT_DIR = STATE_DIR / "youtube_checkpoints"
 MEDIA_CACHE_DIR = PROJECT_ROOT / os.getenv("MEDIA_CACHE_DIR", "./media_cache")
+MEDIA_PROCESSING_MODE = os.getenv("MEDIA_PROCESSING_MODE", "selective").strip().lower()
+if MEDIA_PROCESSING_MODE not in {"selective", "all"}:
+    raise ValueError("MEDIA_PROCESSING_MODE must be selective or all")
 LOG_DIR = PROJECT_ROOT / os.getenv("LOG_DIR", "./logs")
 MEDIA_CAPTURE_ENABLED = os.getenv("MEDIA_CAPTURE_ENABLED", "true").lower() == "true"
 MEDIA_CAPTURE_MAX_BYTES = int(os.getenv("MEDIA_CAPTURE_MAX_BYTES", "0"))
