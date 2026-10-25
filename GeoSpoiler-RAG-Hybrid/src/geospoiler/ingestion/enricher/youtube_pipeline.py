@@ -110,6 +110,8 @@ def enrich_youtube_all(
     *,
     channel_filter: str | None = None,
     force: bool = False,
+    metadata_paths: list[Path] | None = None,
+    legacy_meta_paths: list[Path] | None = None,
 ) -> YouTubeEnrichmentStats:
     """Enrich dedicated YouTube artifacts and legacy normalized YouTube posts."""
     stats = YouTubeEnrichmentStats()
@@ -117,14 +119,14 @@ def enrich_youtube_all(
     discovery_errors: list[tuple[Path, str]] = []
 
     def iter_sources():
-        for source in _iter_dedicated_sources(channel_filter, discovery_errors):
+        for source in _iter_dedicated_sources(channel_filter, discovery_errors, metadata_paths):
             key = _source_key(source)
             if key not in seen_keys:
                 seen_keys.add(key)
                 yield source
         # Existing normalized YouTube posts predate timed artifacts. Read them
         # as a no-cue fallback so regeneration does not lose the current corpus.
-        for source in _iter_legacy_sources(channel_filter, discovery_errors):
+        for source in _iter_legacy_sources(channel_filter, discovery_errors, legacy_meta_paths):
             key = _source_key(source)
             if key not in seen_keys:
                 seen_keys.add(key)
@@ -708,11 +710,12 @@ def _segment_card_payload(card: YouTubeSegmentCardV2, spec: SegmentSpec) -> dict
 def _iter_dedicated_sources(
     channel_filter: str | None,
     discovery_errors: list[tuple[Path, str]] | None = None,
+    metadata_paths: list[Path] | None = None,
 ):
     root = config.YOUTUBE_NORMALIZED_DIR
     if not root.exists():
         return
-    for metadata_path in sorted(root.rglob("*.youtube.meta.json")):
+    for metadata_path in sorted(root.rglob("*.youtube.meta.json") if metadata_paths is None else metadata_paths):
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             default_stem = metadata_path.name.removesuffix(".meta.json")
@@ -742,11 +745,12 @@ def _iter_dedicated_sources(
 def _iter_legacy_sources(
     channel_filter: str | None,
     discovery_errors: list[tuple[Path, str]] | None = None,
+    metadata_paths: list[Path] | None = None,
 ):
     root = config.NORMALIZED_DIR
     if not root.exists():
         return
-    for meta_path in sorted(root.rglob("*.meta.json")):
+    for meta_path in sorted(root.rglob("*.meta.json") if metadata_paths is None else metadata_paths):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
             if not isinstance(metadata, dict):

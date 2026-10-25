@@ -3,6 +3,13 @@
 This document records the data contracts for GeoSpoiler enriched v2 pipeline.
 All cards use `enriched_v2` schema. No backward compatibility with v1.
 
+New normalized sidecars include code-owned `normalized_text_sha256`, calculated
+over the saved UTF-8 text bytes. Text and sidecar are staged separately and the
+sidecar is published last. Enrichment verifies the digest before admission and
+again before processing, so an interrupted overwrite cannot pair new text with
+old metadata. Existing sidecars without this additive field retain their schema
+validation path. A missing, empty or mismatched pair cannot publish a new card.
+
 ## Modules
 
 - `src/geospoiler/contracts/models.py` — Pydantic models: `LLMPayload`, `EnrichedCardV2`, `NormalizedMeta`

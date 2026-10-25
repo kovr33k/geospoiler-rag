@@ -5,6 +5,7 @@ Takes classified messages from the router and runs appropriate handlers,
 then assembles everything into a single normalized text file per message.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from geospoiler import config
+from geospoiler.contracts.models import NormalizedMeta
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMedia, TelegramMessage
 from geospoiler.ingestion.normalizer.ai_chat_handler import queue_for_review
 from geospoiler.ingestion.normalizer.image_handler import describe_image
@@ -621,14 +623,36 @@ def _get_filepath(msg: TelegramMessage) -> Path:
 def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = None) -> Path:
     """Save normalized text plus sidecar metadata to files."""
     filepath = _get_filepath(msg)
-    filepath.write_text(text, encoding="utf-8")
+    text_tmp = filepath.with_name(f".{filepath.name}.tmp")
+    text_tmp.write_bytes(text.encode("utf-8"))
     if metadata is not None:
         meta_path = filepath.with_suffix(".meta.json")
-        meta_path.write_text(
+        meta_tmp = meta_path.with_name(f".{meta_path.name}.tmp")
+        metadata = {**metadata, "normalized_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+        meta_tmp.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        text_tmp.replace(filepath)
+        # Publishing metadata last marks a complete text/sidecar pair. The hash
+        # detects an interrupted overwrite that retained the previous sidecar.
+        meta_tmp.replace(meta_path)
+    else:
+        text_tmp.replace(filepath)
     return filepath
+
+
+def read_normalized_meta(path: Path) -> NormalizedMeta:
+    """Validate saved input readiness, including interrupted pair publication."""
+    text = path.read_bytes()
+    if not text.decode("utf-8").strip():
+        raise ValueError(f"Empty normalized text: {path}")
+    metadata = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    meta = NormalizedMeta.model_validate(metadata)
+    expected_hash = metadata.get("normalized_text_sha256")
+    if expected_hash is not None and expected_hash != hashlib.sha256(text).hexdigest():
+        raise ValueError(f"Incomplete normalized text/metadata pair: {path}")
+    return meta
 
 
 def _sanitize(name: str) -> str:

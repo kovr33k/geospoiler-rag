@@ -1,7 +1,11 @@
 """Pipeline, review, status, and quality CLI command implementations."""
 
+import asyncio
+import json
 import os
+import queue
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +22,12 @@ from geospoiler.evaluation.baseline_probe import (
 from geospoiler.ingestion.enricher.pipeline import EnrichmentStats, enrich_all
 from geospoiler.ingestion.fetcher.state import get_all_progress, mark_message_processed
 from geospoiler.ingestion.fetcher.telegram_client import TelegramFetcher, TelegramMessage
-from geospoiler.ingestion.normalizer.pipeline import NormalizationBatchResult, normalize_batch
+from geospoiler.ingestion.normalizer.pipeline import (
+    NormalizationBatchResult,
+    _get_filepath,
+    normalize_batch,
+    read_normalized_meta,
+)
 from geospoiler.ingestion.normalizer.review_queue import get_pending_reviews
 from geospoiler.operations.release_identity import safe_resolve_release_path
 from geospoiler.providers import llm_backend
@@ -181,15 +190,18 @@ async def cmd_load(
 def cmd_enrich(
     channel_filter: str | None = None,
     force: bool = False,
+    *,
+    ready_paths: queue.Queue | None = None,
 ) -> EnrichCommandStats:
     """Enrich normalized posts and refresh indexes derived from saved cards."""
     logger.info("=== ENRICH: Building memory cards ===")
 
     stats: EnrichmentStats | None = None
-    enrichment_error: Exception | None = None
+    enrichment_error: BaseException | None = None
     try:
-        stats = enrich_all(channel_filter=channel_filter, force=force)
-    except Exception as exc:
+        kwargs = {} if ready_paths is None else {"ready_paths": ready_paths}
+        stats = enrich_all(channel_filter=channel_filter, force=force, **kwargs)
+    except BaseException as exc:
         enrichment_error = exc
 
     try:
@@ -197,7 +209,7 @@ def cmd_enrich(
         refresh_stats = refresh_enriched_retrieval()
     except RetrievalRefreshError as refresh_error:
         if enrichment_error is not None:
-            raise ExceptionGroup(
+            raise BaseExceptionGroup(
                 "Enrichment and retrieval refresh failed",
                 [enrichment_error, refresh_error],
             ) from refresh_error
@@ -319,18 +331,96 @@ async def cmd_run(limit: int | None = None):
 
     channel_messages = await cmd_fetch(limit=limit)
 
-    normalize_stats = NormalizationBatchResult()
     total_msgs = sum(len(msgs) for _, msgs in channel_messages)
     if total_msgs > 0:
-        normalize_stats = await cmd_normalize(channel_messages)
+        ready_paths = queue.Queue(maxsize=max(1, config.ENRICHMENT_CONCURRENCY))
+        stop = threading.Event()
+        consumer_done = threading.Event()
+
+        def consume():
+            try:
+                return cmd_enrich(ready_paths=ready_paths)
+            finally:
+                consumer_done.set()
+                stop.set()
+
+        producer = asyncio.create_task(asyncio.to_thread(
+            _normalize_into_queue, channel_messages, ready_paths, stop, consumer_done))
+        consumer = asyncio.create_task(asyncio.to_thread(consume))
+        try:
+            enrich_stats = await asyncio.shield(consumer)
+            normalize_stats = await asyncio.shield(producer)
+        finally:
+            stop.set()
+            # Drain/cancel admission before returning, including caller cancellation.
+            # Existing in-flight backend calls retain their normal bounded timeout.
+            await asyncio.gather(asyncio.shield(producer), asyncio.shield(consumer), return_exceptions=True)
     else:
         logger.info("No new Telegram messages to normalize.")
-
-    # Enrich all posts (incremental — only new/changed)
-    enrich_stats = cmd_enrich()
+        normalize_stats = NormalizationBatchResult()
+        enrich_stats = cmd_enrich()
     _print_pipeline_summary(channel_messages, normalize_stats, enrich_stats)
 
     logger.info("=== FULL PIPELINE COMPLETE ===")
+
+
+def _normalize_into_queue(channel_messages, ready_paths, stop, consumer_done) -> NormalizationBatchResult:
+    summary = NormalizationBatchResult()
+
+    def admit(path):
+        while not stop.is_set():
+            try:
+                ready_paths.put(path, timeout=0.05)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    try:
+        incoming = {_get_filepath(msg) for _, messages in channel_messages for msg in messages}
+        incoming_ids = {(msg.channel_id, msg.message_id) for _, messages in channel_messages for msg in messages}
+        for path in sorted(config.YOUTUBE_NORMALIZED_DIR.rglob("*.youtube.meta.json")):
+            try:
+                source = json.loads(path.read_text(encoding="utf-8")).get("telegram_source", {})
+                if (source.get("channel_id"), source.get("message_id")) in incoming_ids:
+                    continue
+            except (OSError, ValueError, AttributeError):
+                pass  # Let the source owner retain discovery diagnostics.
+            if not admit(path):
+                return summary
+        # Resume saved work even if Telegram's fetch checkpoint has advanced.
+        for path in sorted(config.NORMALIZED_DIR.rglob("*.txt")):
+            if path not in incoming and not admit(path):
+                return summary
+        for _, messages in channel_messages:
+            successes = set()
+            marked = 0
+            for msg in sorted(messages, key=lambda item: item.message_id):
+                if stop.is_set():
+                    return summary
+                result = normalize_batch([msg])
+                summary.merge(result)
+                for filepath, _ in result.texts_with_paths:
+                    path = Path(filepath)
+                    meta = read_normalized_meta(path)
+                    for source in (meta.model_extra or {}).get("youtube_sources", []):
+                        metadata_path = source.get("metadata_path")
+                        if metadata_path and not admit(config.resolve_project_path(metadata_path)):
+                            return summary
+                    if not admit(path):
+                        return summary
+                    successes.add(msg.message_id)
+                current = _mark_contiguous_processed(messages, successes)
+                summary.processed_messages += current - marked
+                marked = current
+        return summary
+    finally:
+        while not consumer_done.is_set():
+            try:
+                ready_paths.put(None, timeout=0.05)
+                break
+            except queue.Full:
+                pass
 
 
 async def cmd_rebuild():

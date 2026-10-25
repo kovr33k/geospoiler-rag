@@ -18,6 +18,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import queue
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -47,6 +48,7 @@ from geospoiler.ingestion.enricher.validator import (
     validate_payload,
 )
 from geospoiler.ingestion.enricher.youtube_pipeline import _looks_like_legacy_youtube_document, enrich_youtube_all
+from geospoiler.ingestion.normalizer.pipeline import read_normalized_meta
 from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_ENRICHMENT_FAILURE, REVIEW_TYPE_UNINFORMATIVE
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
 from geospoiler.ingestion.normalizer.youtube_handler import redact_sensitive_url
@@ -89,6 +91,8 @@ class EnrichmentStats:
 def enrich_all(
     channel_filter: str | None = None,
     force: bool = False,
+    *,
+    ready_paths: queue.Queue | None = None,
 ) -> EnrichmentStats:
     """
     Scan normalized directory and create/update enriched memory cards.
@@ -102,24 +106,18 @@ def enrich_all(
     """
     stats = EnrichmentStats()
     progress = _load_progress()
-    jobs = _collect_enrichment_jobs(
-        progress=progress,
-        channel_filter=channel_filter,
-        force=force,
-        stats=stats,
-    )
-
-    _run_enrichment_jobs(jobs, progress, stats)
+    if ready_paths is None:
+        jobs = _collect_enrichment_jobs(
+            progress=progress, channel_filter=channel_filter, force=force, stats=stats,
+        )
+        _run_enrichment_jobs(jobs, progress, stats)
+    else:
+        _run_ready_enrichment(ready_paths, progress, stats, force=force)
     # Persist completed generic work before the potentially long YouTube pass.
     # Otherwise an interrupted YouTube run makes all generic LLM work repeat.
     _save_progress(progress)
-    youtube_stats = enrich_youtube_all(channel_filter=channel_filter, force=force)
-    stats.youtube_sources = youtube_stats.sources_scanned
-    stats.youtube_episodes = youtube_stats.episodes_written
-    stats.youtube_skipped = youtube_stats.episodes_skipped
-    stats.youtube_segments = youtube_stats.segments_written
-    stats.youtube_partial = youtube_stats.partial_sources
-    stats.youtube_failed = youtube_stats.failed_sources
+    if ready_paths is None:
+        _add_youtube_stats(stats, enrich_youtube_all(channel_filter=channel_filter, force=force))
     _save_progress(progress)
 
     logger.info(
@@ -149,11 +147,14 @@ def _collect_enrichment_jobs(
     channel_filter: str | None,
     force: bool,
     stats: EnrichmentStats,
+    normalized_paths: list[Path] | None = None,
 ) -> list[_EnrichmentJob]:
     normalized_dir = config.NORMALIZED_DIR
     enriched_dir = config.ENRICHED_DIR
 
-    if channel_filter:
+    if normalized_paths is not None:
+        channel_dirs = sorted({path.parent for path in normalized_paths})
+    elif channel_filter:
         channel_dirs = [normalized_dir / channel_filter]
         if not channel_dirs[0].exists():
             logger.error(f"Channel directory not found: {channel_dirs[0]}")
@@ -164,7 +165,7 @@ def _collect_enrichment_jobs(
     jobs: list[_EnrichmentJob] = []
     for channel_dir in channel_dirs:
         channel_name = channel_dir.name
-        txt_files = sorted(channel_dir.glob("*.txt"))
+        txt_files = sorted(path for path in normalized_paths if path.parent == channel_dir) if normalized_paths is not None else sorted(channel_dir.glob("*.txt"))
 
         for txt_path in txt_files:
             stats.scanned += 1
@@ -180,9 +181,7 @@ def _collect_enrichment_jobs(
                 continue
 
             try:
-                normalized_meta = NormalizedMeta.model_validate_json(
-                    meta_path.read_text(encoding="utf-8")
-                )
+                normalized_meta = read_normalized_meta(txt_path)
                 expected_source_id = _build_source_id(normalized_meta, channel_name, msg_id)
                 metadata_identity_valid = True
                 if normalized_meta.youtube_urls and _is_youtube_only_normalized_document(
@@ -191,7 +190,7 @@ def _collect_enrichment_jobs(
                 ):
                     stats.skipped_youtube += 1
                     continue
-            except (OSError, ValidationError):
+            except (OSError, ValueError):
                 logger.warning("Cannot inspect metadata for %s", progress_key)
 
             source_fingerprint = _source_fingerprint(txt_path, meta_path)
@@ -233,6 +232,66 @@ def _collect_enrichment_jobs(
             )
 
     return jobs
+
+
+def _run_ready_enrichment(ready_paths: queue.Queue, progress: dict, stats: EnrichmentStats, *, force: bool) -> None:
+    """One coordinator publishes results while a bounded producer saves inputs."""
+    concurrency = _enrichment_concurrency()
+    finished = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        pending = {}
+        while not finished or pending:
+            for future in list(pending):
+                if not future.done():
+                    continue
+                job = pending.pop(future)
+                try:
+                    if job is None:
+                        _add_youtube_stats(stats, future.result())
+                    else:
+                        _handle_enrichment_result(job, future.result(), progress, stats)
+                except Exception as exc:
+                    if job is None:
+                        stats.youtube_failed += 1
+                        logger.exception("YouTube stream processing failed")
+                    else:
+                        _record_enrichment_failure(job, exc, stats, progress)
+            if pending and (finished or len(pending) >= concurrency):
+                concurrent.futures.wait(pending, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                continue
+            if finished:
+                continue
+            try:
+                path = ready_paths.get(timeout=0.02)
+            except queue.Empty:
+                continue
+            if path is None:
+                finished = True
+                continue
+            if path.name.endswith(".youtube.meta.json"):
+                future = executor.submit(enrich_youtube_all, force=force, metadata_paths=[path], legacy_meta_paths=[])
+                pending[future] = None
+                continue
+            skipped_youtube = stats.skipped_youtube
+            jobs = _collect_enrichment_jobs(progress=progress, channel_filter=None, force=force,
+                                           stats=stats, normalized_paths=[path])
+            for job in jobs:
+                pending[executor.submit(_run_enrichment_job_with_retry, job, stats)] = job
+            if stats.skipped_youtube > skipped_youtube:
+                meta = read_normalized_meta(path)
+                if not (meta.model_extra or {}).get("youtube_sources"):
+                    future = executor.submit(enrich_youtube_all, force=force, metadata_paths=[],
+                                             legacy_meta_paths=[path.with_suffix(".meta.json")])
+                    pending[future] = None
+
+
+def _add_youtube_stats(stats: EnrichmentStats, youtube_stats) -> None:
+    stats.youtube_sources += youtube_stats.sources_scanned
+    stats.youtube_episodes += youtube_stats.episodes_written
+    stats.youtube_skipped += youtube_stats.episodes_skipped
+    stats.youtube_segments += youtube_stats.segments_written
+    stats.youtube_partial += youtube_stats.partial_sources
+    stats.youtube_failed += youtube_stats.failed_sources
 
 
 def _is_youtube_only_normalized_document(meta: NormalizedMeta, text_path: Path) -> bool:
@@ -305,7 +364,7 @@ def _run_enrichment_job_with_retry(job: _EnrichmentJob, stats: EnrichmentStats) 
 def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | None:
     """Run the full enrichment pipeline for a single post."""
     normalized_text = job.txt_path.read_text(encoding="utf-8")
-    meta = NormalizedMeta.model_validate_json(job.meta_path.read_text(encoding="utf-8"))
+    meta = read_normalized_meta(job.txt_path)
     meta_data = meta.model_dump(mode="json")
 
     # 1. Content type classification (rule-based)
