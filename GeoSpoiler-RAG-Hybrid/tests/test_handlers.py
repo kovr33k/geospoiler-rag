@@ -740,6 +740,7 @@ class InstagramCacheTests(unittest.TestCase):
             self.assertIn("очеред", result.lower())
             self.assertNotIn("Old caption", result)
 
+    @patch("normalizer.instagram_handler.config.TRANSCRIPTION_API_KEY", "offline-test-key")
     def test_reel_with_caption_and_transcript_is_accepted_as_partial_success(self):
         info = {"description": "Caption", "uploader": "user", "duration": 10}
         with tempfile.TemporaryDirectory() as tmpdir:
