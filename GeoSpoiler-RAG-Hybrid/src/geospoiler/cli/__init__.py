@@ -1,0 +1,1 @@
+"""GeoSpoiler cli package."""

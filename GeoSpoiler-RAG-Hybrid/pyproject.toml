@@ -1,0 +1,136 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geospoiler-rag-hybrid"
+version = "0.1.0"
+description = "Telegram-to-RAG OSINT memory pipeline with FTS, source registry, and evaluation tooling."
+requires-python = ">=3.11"
+dependencies = [
+    "telethon>=1.36.0",
+    "lightrag-hku==1.5.4",
+    "openai>=2.0.0",
+    "crawl4ai>=0.4.0",
+    "streamlit>=1.40.0",
+    "requests>=2.31.0",
+    "yt-dlp>=2026.7.4",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "aiofiles>=24.0.0",
+    "Pillow>=10.0.0",
+    "qrcode>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=3.6.0",
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[tool.setuptools]
+packages = [
+    "enricher",
+    "eval",
+    "eval.model_bakeoff",
+    "eval.model_bakeoff.prompts",
+    "experiments",
+    "fetcher",
+    "geospoiler",
+    "geospoiler.answering",
+    "geospoiler.cli",
+    "geospoiler.compat",
+    "geospoiler.contracts",
+    "geospoiler.evaluation",
+    "geospoiler.evaluation.experiments",
+    "geospoiler.evaluation.model_bakeoff",
+    "geospoiler.evaluation.model_bakeoff.prompts",
+    "geospoiler.ingestion",
+    "geospoiler.ingestion.enricher",
+    "geospoiler.ingestion.fetcher",
+    "geospoiler.ingestion.normalizer",
+    "geospoiler.ingestion.normalizer.instagram",
+    "geospoiler.operations",
+    "geospoiler.providers",
+    "geospoiler.retrieval",
+    "geospoiler.retrieval.cards",
+    "geospoiler.retrieval.lightrag",
+    "geospoiler.retrieval.youtube",
+    "geospoiler.sources",
+    "geospoiler.testing_support",
+    "geospoiler.ui",
+    "geospoiler.wiki",
+    "loader",
+    "normalizer",
+    "normalizer.instagram",
+    "retrieval",
+    "retrieval.wiki",
+    "scripts",
+    "testing"
+]
+py-modules = [
+    "auth",
+    "baseline_probe",
+    "check",
+    "cli",
+    "cli_app",
+    "cli_pipeline",
+    "cli_query",
+    "cli_runtime",
+    "cli_tools",
+    "cli_wiki",
+    "config",
+    "data_validation",
+    "debug_dialogs",
+    "experiment_registry",
+    "golden_compare",
+    "llm_auth",
+    "llm_backend",
+    "llm_verification_probe",
+    "main",
+    "models",
+    "qr_terminal",
+    "reranker",
+    "reviewer_app",
+    "source_selection_golden",
+    "wiki_reviewer"
+]
+
+[tool.setuptools.package-dir]
+geospoiler = "src/geospoiler"
+
+[tool.setuptools.package-data]
+"geospoiler.evaluation.model_bakeoff" = ["models.yaml", "prompts/*.txt", "suites/*.jsonl"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+    ".venv",
+    ".tmp-tests",
+    "artifacts",
+    "logs",
+    "media_cache",
+    "output",
+    "rag_storage",
+    "rag_storage_backups",
+    "rag_storage_failed_rebuild_*",
+    "state",
+    "data",
+    "backups",
+    "_test_archive",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_*.py" = ["B011"]
+
+[tool.unittest]
+start-directory = "tests"
+pattern = "test_*.py"

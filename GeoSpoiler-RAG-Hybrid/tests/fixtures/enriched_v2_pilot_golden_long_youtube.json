@@ -1,0 +1,40 @@
+{
+  "queries": [
+    {
+      "query": "Польша Восточный щит укрепления границы с Россией и Беларусью",
+      "must_find_source_ids": [
+        "telegram:3889026624:3:youtube:S-FlOHCkEYo"
+      ]
+    },
+    {
+      "query": "Китай расширил режим выездных согласований для AI специалистов Alibaba и DeepSeek",
+      "must_find_source_ids": [
+        "telegram:3001055698:103"
+      ]
+    },
+    {
+      "query": "вотум недоверия Урсуле фон дер Ляйен Pfizergate",
+      "must_find_source_ids": [
+        "telegram:3299898370:21"
+      ]
+    },
+    {
+      "query": "Funnel up to $1 billion into Kim Jong Un's nuclear program",
+      "must_find_source_ids": [
+        "telegram:3001055698:24"
+      ]
+    },
+    {
+      "query": "Китай требует от Украины защищать права китайских граждан, попавших в плен",
+      "must_find_source_ids": [
+        "telegram:3001055698:93"
+      ]
+    },
+    {
+      "query": "арктическое направление высокие риски сложная логистика",
+      "must_find_source_ids": [
+        "telegram:3001055698:69"
+      ]
+    }
+  ]
+}

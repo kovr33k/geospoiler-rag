@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Local test scratch space
+.tmp-tests/
+.pytest_cache/
+.pytest-*/
+pytest-*/
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+state/
+
+# Generated local data
+logs/
+media_cache/
+output/*
+rag_storage/
+rag_storage_backups/
+rag_storage_failed_rebuild_*/
+
+# Runtime caches and local databases
+rag_storage/kv_store_llm_response_cache*.json
+artifacts/*.sqlite
+artifacts/*.pid
+artifacts/*stdout.log
+artifacts/*stderr.log
+artifacts/ig_test_*.txt
+artifacts/telegram_qr*.png
+artifacts/*cache_backups/
+artifacts/reranker_cache_backups/
+artifacts/retired_model_archive/
+
+# Retired provider setup helpers
+setup_vertex_adc.ps1
+
+# Local test archive (development-era experiment results)
+_test_archive/
+
+# Active migrated data and rollback copies are local, never source artifacts.
+data/
+backups/
+*.session
+*.session-journal
+source_registry.sqlite

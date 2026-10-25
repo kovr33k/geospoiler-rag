@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: ["--config=pyproject.toml"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+        exclude: ^(output|artifacts|logs|media_cache|rag_storage|rag_storage_backups|state|data|backups)/
+      - id: trailing-whitespace
+        exclude: ^(output|artifacts|logs|media_cache|rag_storage|rag_storage_backups|state|data|backups)/

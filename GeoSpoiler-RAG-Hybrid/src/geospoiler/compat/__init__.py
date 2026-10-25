@@ -1,0 +1,1 @@
+"""GeoSpoiler compat package."""

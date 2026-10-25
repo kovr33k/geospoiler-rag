@@ -1,0 +1,16 @@
+You are testing a model for LightRAG-style graph build extraction.
+
+Return only extraction lines in this exact format:
+
+entity<|#|><name><|#|><type><|#|><description>
+relation<|#|><source><|#|><target><|#|><keywords><|#|><description>
+<|COMPLETE|>
+
+Allowed types: person, organization, country, military_unit, event, location, conflict, document, other.
+
+Rules:
+- Ignore metadata headers, URLs, filenames, channel names, post numbers, and dates as entities.
+- Extract only explicit relationships from the source text.
+- Keep allegations, denials, and uncertainty as attributed in descriptions.
+- Do not invent entities, dates, sources, or relations.
+- End with <|COMPLETE|>.

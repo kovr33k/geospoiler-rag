@@ -1,0 +1,101 @@
+{
+  "repo": "kovr33k/geospoiler-rag",
+  "parent": 1,
+  "tickets": [
+    {
+      "id": 1,
+      "number": 2,
+      "database_id": 6029638888,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/2",
+      "title": "Перенести актуальный RAG в main нового приватного репозитория",
+      "blocked_by": []
+    },
+    {
+      "id": 2,
+      "number": 3,
+      "database_id": 6029639197,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/3",
+      "title": "Проверять актуальный RAG полным pytest и Ruff в CI Windows и Linux",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 3,
+      "number": 4,
+      "database_id": 6029639658,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/4",
+      "title": "Загружать уверенно русский текст без модельного перевода",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "number": 5,
+      "database_id": 6029640098,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/5",
+      "title": "Обрабатывать партию с общим пределом в три LLM-вызова",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "number": 6,
+      "database_id": 6029640570,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/6",
+      "title": "Сохранять валидные карточки и YouTube-генерации при смене модели",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 6,
+      "number": 7,
+      "database_id": 6029641017,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/7",
+      "title": "Обогащать материал сразу после готовности нормализованного входа",
+      "blocked_by": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "number": 8,
+      "database_id": 6029641427,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/8",
+      "title": "Скачивать и анализировать медиа только при зависимости текста от вложения",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 8,
+      "number": 9,
+      "database_id": 6029641855,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/9",
+      "title": "Загружать в LightRAG только новые, изменённые и незавершённые документы",
+      "blocked_by": [
+        2
+      ]
+    },
+    {
+      "id": 9,
+      "number": 10,
+      "database_id": 6029642291,
+      "url": "https://github.com/kovr33k/geospoiler-rag/issues/10",
+      "title": "Подтвердить полный рабочий цикл и завершить переход на новый RAG-репозиторий",
+      "blocked_by": [
+        3,
+        4,
+        6,
+        7,
+        8,
+        9
+      ]
+    }
+  ],
+  "verified": true,
+  "parent_unchanged": true
+}
