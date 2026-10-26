@@ -4,6 +4,8 @@ Telegram-to-RAG pipeline for collecting posts, normalizing linked content, and l
 
 Итог текущего перехода: [приёмка заливки и рабочего маршрута](docs/INGESTION_ACCEPTANCE_20261026.md). Изменения находятся в `main`; отчёт разделяет реальную проверку, ограничения выборочного медиа и исторические результаты.
 
+На рабочей машине проект собран в одной папке `D:/RAG-GEOSP/RAG-GeoSpoiler`. Запускайте приложение из её подкаталога `GeoSpoiler-RAG-Hybrid` через собственную `.venv`; код, `.env` и данные используют эту же рабочую копию. Соседняя папка `geospoiler-rag` и внешний `geospoiler-rag.ps1` для работы не нужны.
+
 ## What It Does
 
 The pipeline can:

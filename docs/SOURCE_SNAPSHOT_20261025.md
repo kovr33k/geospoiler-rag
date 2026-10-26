@@ -51,3 +51,15 @@ repository. Its history remains reachable from the private backup; the remaining
 `geospoiler-rag-hybrid-backup` is now archived. Original local files and data remain
 in place. See the application's final ingestion acceptance report for evidence
 and the local launcher route.
+
+## Local consolidation, 26 October 2026
+
+At the owner's request, the active source and Git metadata were moved back to
+`D:/RAG-GEOSP/RAG-GeoSpoiler`. This is the sole active checkout, on `main` with
+`origin` pointing to `kovr33k/geospoiler-rag`. Runtime data, `.env` and local
+unpublished files remain in place; the existing application `.venv` now has the
+required dependencies and its editable installation points to this checkout.
+Normal commands run directly from `GeoSpoiler-RAG-Hybrid/`; no external launcher
+or second source directory is required. The original Git metadata, uncommitted
+patch and retained verification evidence are backed up in the existing local
+backup directory as `ingestion-migration-20261026.zip`.
