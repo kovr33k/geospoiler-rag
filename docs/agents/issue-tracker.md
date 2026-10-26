@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-Issues and specs for GeoSpoiler RAG live in [kovr33k/geospoiler-rag](https://github.com/kovr33k/geospoiler-rag/issues), a private repository.
+Issues and specs for GeoSpoiler RAG live in [kovr33k/geospoiler-rag](https://github.com/kovr33k/geospoiler-rag/issues), made public at the user's explicit request on 26 October 2026.
 
 Use the `gh` CLI. Always supply `--repo kovr33k/geospoiler-rag`; the current checkout's older remotes are not the tracker authority. With GitHub API operations, use the exact `repos/kovr33k/geospoiler-rag` endpoint.
 

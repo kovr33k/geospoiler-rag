@@ -25,6 +25,9 @@ class _FakeRag:
 
 
 class MainQueryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(cli_app.llm_backend, "validate_luna_configuration"))
+
     async def test_cmd_query_exits_nonzero_when_rag_returns_no_answer(self):
         rag = _FakeRag()
         output = io.StringIO()

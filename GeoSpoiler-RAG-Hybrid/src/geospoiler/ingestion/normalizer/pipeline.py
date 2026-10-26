@@ -5,6 +5,7 @@ Takes classified messages from the router and runs appropriate handlers,
 then assembles everything into a single normalized text file per message.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -12,11 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from geospoiler import config
+from geospoiler.contracts.models import NormalizedMeta
 from geospoiler.ingestion.fetcher.telegram_client import TelegramMedia, TelegramMessage
 from geospoiler.ingestion.normalizer.ai_chat_handler import queue_for_review
+from geospoiler.ingestion.normalizer.atomic_pair import atomic_write_bytes, atomic_write_pair, recover_atomic_pair
+from geospoiler.ingestion.normalizer.document_handler import extract_document_text
 from geospoiler.ingestion.normalizer.image_handler import describe_image
 from geospoiler.ingestion.normalizer.instagram_handler import extract_instagram_text
 from geospoiler.ingestion.normalizer.media_paths import portable_media_path, portable_project_path
+from geospoiler.ingestion.normalizer.media_selection import media_operations
 from geospoiler.ingestion.normalizer.media_vision import VisualExtractionResult, analyze_image, analyze_video
 from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_EXTERNAL_LINK
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
@@ -237,7 +242,8 @@ def normalize_message(
     # The header is sections[0]. We should not translate the header to avoid breaking metadata parsers.
     header = sections[0]
     body_text = "\n\n".join(sections[1:])
-    translated_body = translate_to_russian_if_needed(body_text)
+    policy_only_media = not has_body_text and bool(msg.media) and all(item.analysis_operations == [] for item in msg.media)
+    translated_body = body_text if policy_only_media else translate_to_russian_if_needed(body_text)
 
     full_text = f"{header}\n\n{translated_body}"
     metadata = _build_metadata(
@@ -306,9 +312,10 @@ def _accumulate_classification_stats(
     if classified.has_text:
         batch.messages_with_text += 1
 
-    if classified.image_paths:
+    image_count = max(len(classified.image_paths), sum(item.media_type == "image" for item in classified.media))
+    if image_count:
         batch.messages_with_images += 1
-        batch.images_total += len(classified.image_paths)
+        batch.images_total += image_count
 
     if classified.has_video:
         batch.messages_with_native_video += 1
@@ -385,8 +392,8 @@ def _build_metadata(
         "forward_date": msg.forward_date.isoformat() if msg.forward_date else None,
         "has_text": classified.has_text,
         "has_body_text": has_body_text,
-        "has_images": bool(classified.image_paths),
-        "image_count": len(classified.image_paths),
+        "has_images": bool(classified.image_paths) or any(item.media_type == "image" for item in classified.media),
+        "image_count": max(len(classified.image_paths), sum(item.media_type == "image" for item in classified.media)),
         "image_paths": [portable_media_path(path) for path in classified.image_paths],
         "has_video": classified.has_video,
         "has_voice": classified.has_voice,
@@ -417,10 +424,26 @@ def _build_media_sections(
     transcriptions = []
     visual_metadata = []
     for item in classified.media:
-        if item.media_type not in {"video", "audio", "voice"}:
+        if item.media_type not in {"video", "audio", "voice", "document"}:
+            continue
+        operations = _select_operations(item, msg.text)
+        if not operations:
+            sections.append(_format_media_placeholder(item))
+            continue
+        if item.media_type == "document":
+            try:
+                if item.download_status != "downloaded":
+                    raise ValueError(item.error or "document_not_downloaded")
+                text = extract_document_text(item.file_path, item.mime_type)
+                item.text_extraction_status = "success"
+                sections.append(f"[Текст документа]\n{text}")
+            except Exception as exc:
+                item.text_extraction_status = "failed"
+                item.text_extraction_error = str(exc)
+                sections.append(_format_media_placeholder(item))
             continue
         processed = False
-        if item.media_type == "video" and item.file_path and item.download_status == "downloaded":
+        if "vision" in operations and item.media_type == "video" and item.file_path and item.download_status == "downloaded":
             visual = analyze_video(
                 item.file_path,
                 source_key=f"{msg.channel_name}:{msg.message_id}:{item.message_id}",
@@ -429,12 +452,13 @@ def _build_media_sections(
             if visual.status == "success" and visual.text.strip():
                 sections.append(f"[Текст с экрана (OCR)]\n{visual.text.strip()}")
                 processed = True
-        result = transcribe_media(item, msg.channel_name, msg.message_id)
-        transcript_meta = _transcription_to_metadata(item, result)
-        transcriptions.append(transcript_meta)
-        if result.status == "transcribed" and result.text.strip():
-            sections.append(_format_transcript_section(item, result))
-            processed = True
+        if "transcribe" in operations:
+            result = transcribe_media(item, msg.channel_name, msg.message_id)
+            transcript_meta = _transcription_to_metadata(item, result)
+            transcriptions.append(transcript_meta)
+            if result.status == "transcribed" and result.text.strip():
+                sections.append(_format_transcript_section(item, result))
+                processed = True
         if not processed:
             sections.append(_format_media_placeholder(item))
 
@@ -443,6 +467,13 @@ def _build_media_sections(
     if not sections and classified.has_voice:
         sections.append("[Аудио: пост содержал аудио - не обработано]")
     return sections, transcriptions, visual_metadata
+
+
+def _select_operations(item: TelegramMedia, caption: str) -> list[str]:
+    operations = media_operations(caption, item.media_type)
+    item.analysis_operations = operations
+    item.selection_reason = "explicit_dependency" if operations else "no_explicit_dependency"
+    return operations
 
 
 def _build_image_sections(
@@ -467,7 +498,10 @@ def _build_image_sections(
         if item.media_type != "image":
             continue
         processed_paths.add(item.file_path)
-        if item.file_path and item.download_status == "downloaded":
+        operations = _select_operations(item, caption)
+        if not operations:
+            visual = VisualExtractionResult(status="not_analyzed")
+        elif item.file_path and item.download_status == "downloaded":
             visual = analyze_image(item.file_path, caption=caption)
         else:
             visual = VisualExtractionResult(
@@ -487,13 +521,18 @@ def _build_image_sections(
     for img_path in classified.image_paths:
         if img_path in processed_paths:
             continue
-        sections.append(describe_image(img_path, caption=caption))
+        if media_operations(caption, "image"):
+            sections.append(describe_image(img_path, caption=caption))
+        else:
+            sections.append("[Изображение: вложение не анализировалось по выборочной политике]")
 
     return sections, visual_metadata
 
 
 def _format_image_result(result: VisualExtractionResult, source_path: str) -> str:
     """Format image analysis without presenting failures as visual evidence."""
+    if result.status == "not_analyzed":
+        return "[Изображение: вложение не анализировалось по выборочной политике]"
     if result.status == "success" and result.text.strip():
         return f"[Изображение]\n{result.text.strip()}"
     parts = ["Изображение: описание недоступно", f"status={result.status}"]
@@ -505,13 +544,17 @@ def _format_image_result(result: VisualExtractionResult, source_path: str) -> st
 
 
 def _format_media_placeholder(item: TelegramMedia) -> str:
-    if item.media_type == "video":
+    if item.media_type == "document":
+        prefix = "Документ: вложение не обработано"
+    elif item.media_type == "video":
         prefix = "Видео: пост содержал видео - не обработано"
     elif item.media_type == "voice":
         prefix = "Аудио: пост содержал голосовое сообщение - не обработано"
     else:
         prefix = "Аудио: пост содержал аудио - не обработано"
 
+    if item.analysis_operations == []:
+        prefix += "; вложение не анализировалось по выборочной политике"
     parts = [prefix, f"status={item.download_status}"]
     if item.file_path:
         parts.append(f"path={item.file_path}")
@@ -519,6 +562,8 @@ def _format_media_placeholder(item: TelegramMedia) -> str:
         parts.append(f"mime={item.mime_type}")
     if item.error:
         parts.append(f"error={item.error}")
+    if item.text_extraction_error:
+        parts.append(f"extraction_error={item.text_extraction_error}")
     return "[" + " | ".join(parts) + "]"
 
 
@@ -559,6 +604,12 @@ def _media_to_metadata(
         "file_path": portable_media_path(item.file_path),
         "download_status": item.download_status,
         "error": item.error,
+        "attachment_id": item.attachment_id,
+        "analysis_operations": item.analysis_operations,
+        "selection_reason": item.selection_reason,
+        "analysis_status": "not_analyzed" if item.analysis_operations == [] else "requested",
+        "text_extraction_status": item.text_extraction_status,
+        "text_extraction_error": item.text_extraction_error,
     }
     for transcript in transcriptions or []:
         if (
@@ -580,6 +631,11 @@ def _media_to_metadata(
             payload["visual_error"] = visual["error"]
             payload["visual_frame_count"] = visual["frame_count"]
             break
+    if item.analysis_operations:
+        successful = {"vision": payload.get("visual_status") == "success",
+                      "transcribe": payload.get("transcription_status") in {"transcribed", "no_speech"},
+                      "document_text": item.text_extraction_status == "success"}
+        payload["analysis_status"] = "success" if all(successful.get(op, False) for op in item.analysis_operations) else "failed"
     return payload
 
 
@@ -621,14 +677,39 @@ def _get_filepath(msg: TelegramMessage) -> Path:
 def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = None) -> Path:
     """Save normalized text plus sidecar metadata to files."""
     filepath = _get_filepath(msg)
-    filepath.write_text(text, encoding="utf-8")
+    text_bytes = text.encode("utf-8")
     if metadata is not None:
+        metadata = {**metadata, "normalized_text_sha256": hashlib.sha256(text_bytes).hexdigest()}
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
         meta_path = filepath.with_suffix(".meta.json")
-        meta_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        recover_atomic_pair(filepath, meta_path, journal_suffix="normalized")
+        if meta_path.is_file():
+            # A legacy sidecar may survive without its text. Roll back to empty
+            # input in that case so recovery cannot accept new text as old data.
+            atomic_write_pair(filepath, text_bytes, meta_path, metadata_bytes,
+                              original_first=filepath.read_bytes() if filepath.is_file() else b"",
+                              original_second=meta_path.read_bytes(),
+                              journal_suffix="normalized")
+            return filepath
+    atomic_write_bytes(filepath, text_bytes)
+    # Publish metadata last; its hash detects an interrupted pair overwrite.
+    if metadata is not None:
+        atomic_write_bytes(filepath.with_suffix(".meta.json"), metadata_bytes)
     return filepath
+
+
+def read_normalized_meta(path: Path) -> NormalizedMeta:
+    """Validate saved input readiness, including interrupted pair publication."""
+    recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
+    text = path.read_bytes()
+    if not text.decode("utf-8").strip():
+        raise ValueError(f"Empty normalized text: {path}")
+    metadata = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    meta = NormalizedMeta.model_validate(metadata)
+    expected_hash = metadata.get("normalized_text_sha256")
+    if expected_hash is not None and expected_hash != hashlib.sha256(text).hexdigest():
+        raise ValueError(f"Incomplete normalized text/metadata pair: {path}")
+    return meta
 
 
 def _sanitize(name: str) -> str:

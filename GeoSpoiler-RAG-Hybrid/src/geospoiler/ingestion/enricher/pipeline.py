@@ -18,6 +18,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import queue
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -46,7 +47,13 @@ from geospoiler.ingestion.enricher.validator import (
     has_required_language_violations,
     validate_payload,
 )
-from geospoiler.ingestion.enricher.youtube_pipeline import _looks_like_legacy_youtube_document, enrich_youtube_all
+from geospoiler.ingestion.enricher.youtube_pipeline import (
+    _enrich_youtube_sources,
+    _iter_youtube_sources,
+    _looks_like_legacy_youtube_document,
+    enrich_youtube_all,
+)
+from geospoiler.ingestion.normalizer.pipeline import read_normalized_meta
 from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_ENRICHMENT_FAILURE, REVIEW_TYPE_UNINFORMATIVE
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
 from geospoiler.ingestion.normalizer.youtube_handler import redact_sensitive_url
@@ -89,6 +96,8 @@ class EnrichmentStats:
 def enrich_all(
     channel_filter: str | None = None,
     force: bool = False,
+    *,
+    ready_paths: queue.Queue | None = None,
 ) -> EnrichmentStats:
     """
     Scan normalized directory and create/update enriched memory cards.
@@ -102,24 +111,18 @@ def enrich_all(
     """
     stats = EnrichmentStats()
     progress = _load_progress()
-    jobs = _collect_enrichment_jobs(
-        progress=progress,
-        channel_filter=channel_filter,
-        force=force,
-        stats=stats,
-    )
-
-    _run_enrichment_jobs(jobs, progress, stats)
+    if ready_paths is None:
+        jobs = _collect_enrichment_jobs(
+            progress=progress, channel_filter=channel_filter, force=force, stats=stats,
+        )
+        _run_enrichment_jobs(jobs, progress, stats)
+    else:
+        _run_ready_enrichment(ready_paths, progress, stats, force=force)
     # Persist completed generic work before the potentially long YouTube pass.
     # Otherwise an interrupted YouTube run makes all generic LLM work repeat.
     _save_progress(progress)
-    youtube_stats = enrich_youtube_all(channel_filter=channel_filter, force=force)
-    stats.youtube_sources = youtube_stats.sources_scanned
-    stats.youtube_episodes = youtube_stats.episodes_written
-    stats.youtube_skipped = youtube_stats.episodes_skipped
-    stats.youtube_segments = youtube_stats.segments_written
-    stats.youtube_partial = youtube_stats.partial_sources
-    stats.youtube_failed = youtube_stats.failed_sources
+    if ready_paths is None:
+        _add_youtube_stats(stats, enrich_youtube_all(channel_filter=channel_filter, force=force))
     _save_progress(progress)
 
     logger.info(
@@ -149,11 +152,14 @@ def _collect_enrichment_jobs(
     channel_filter: str | None,
     force: bool,
     stats: EnrichmentStats,
+    normalized_paths: list[Path] | None = None,
 ) -> list[_EnrichmentJob]:
     normalized_dir = config.NORMALIZED_DIR
     enriched_dir = config.ENRICHED_DIR
 
-    if channel_filter:
+    if normalized_paths is not None:
+        channel_dirs = sorted({path.parent for path in normalized_paths})
+    elif channel_filter:
         channel_dirs = [normalized_dir / channel_filter]
         if not channel_dirs[0].exists():
             logger.error(f"Channel directory not found: {channel_dirs[0]}")
@@ -164,7 +170,7 @@ def _collect_enrichment_jobs(
     jobs: list[_EnrichmentJob] = []
     for channel_dir in channel_dirs:
         channel_name = channel_dir.name
-        txt_files = sorted(channel_dir.glob("*.txt"))
+        txt_files = sorted(path for path in normalized_paths if path.parent == channel_dir) if normalized_paths is not None else sorted(channel_dir.glob("*.txt"))
 
         for txt_path in txt_files:
             stats.scanned += 1
@@ -180,9 +186,7 @@ def _collect_enrichment_jobs(
                 continue
 
             try:
-                normalized_meta = NormalizedMeta.model_validate_json(
-                    meta_path.read_text(encoding="utf-8")
-                )
+                normalized_meta = read_normalized_meta(txt_path)
                 expected_source_id = _build_source_id(normalized_meta, channel_name, msg_id)
                 metadata_identity_valid = True
                 if normalized_meta.youtube_urls and _is_youtube_only_normalized_document(
@@ -191,7 +195,7 @@ def _collect_enrichment_jobs(
                 ):
                     stats.skipped_youtube += 1
                     continue
-            except (OSError, ValidationError):
+            except (OSError, ValueError):
                 logger.warning("Cannot inspect metadata for %s", progress_key)
 
             source_fingerprint = _source_fingerprint(txt_path, meta_path)
@@ -233,6 +237,73 @@ def _collect_enrichment_jobs(
             )
 
     return jobs
+
+
+def _run_ready_enrichment(ready_paths: queue.Queue, progress: dict, stats: EnrichmentStats, *, force: bool) -> None:
+    """One coordinator publishes results while a bounded producer saves inputs."""
+    concurrency = _enrichment_concurrency()
+    finished = False
+    seen_youtube_keys = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        pending = {}
+
+        def submit_youtube(metadata_paths, legacy_meta_paths):
+            errors = []
+            sources = list(_iter_youtube_sources(channel_filter=None, metadata_paths=metadata_paths,
+                                                 legacy_meta_paths=legacy_meta_paths,
+                                                 seen_keys=seen_youtube_keys, discovery_errors=errors))
+            if sources or errors:
+                pending[executor.submit(_enrich_youtube_sources, sources, force=force, discovery_errors=errors)] = None
+
+        while not finished or pending:
+            for future in list(pending):
+                if not future.done():
+                    continue
+                job = pending.pop(future)
+                try:
+                    if job is None:
+                        _add_youtube_stats(stats, future.result())
+                    else:
+                        _handle_enrichment_result(job, future.result(), progress, stats)
+                except Exception as exc:
+                    if job is None:
+                        stats.youtube_failed += 1
+                        logger.exception("YouTube stream processing failed")
+                    else:
+                        _record_enrichment_failure(job, exc, stats, progress)
+            if pending and (finished or len(pending) >= concurrency):
+                concurrent.futures.wait(pending, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                continue
+            if finished:
+                continue
+            try:
+                path = ready_paths.get(timeout=0.02)
+            except queue.Empty:
+                continue
+            if path is None:
+                finished = True
+                continue
+            if path.name.endswith(".youtube.meta.json"):
+                submit_youtube([path], [])
+                continue
+            skipped_youtube = stats.skipped_youtube
+            jobs = _collect_enrichment_jobs(progress=progress, channel_filter=None, force=force,
+                                           stats=stats, normalized_paths=[path])
+            for job in jobs:
+                pending[executor.submit(_run_enrichment_job_with_retry, job, stats)] = job
+            if stats.skipped_youtube > skipped_youtube:
+                meta = read_normalized_meta(path)
+                if not (meta.model_extra or {}).get("youtube_sources"):
+                    submit_youtube([], [path.with_suffix(".meta.json")])
+
+
+def _add_youtube_stats(stats: EnrichmentStats, youtube_stats) -> None:
+    stats.youtube_sources += youtube_stats.sources_scanned
+    stats.youtube_episodes += youtube_stats.episodes_written
+    stats.youtube_skipped += youtube_stats.episodes_skipped
+    stats.youtube_segments += youtube_stats.segments_written
+    stats.youtube_partial += youtube_stats.partial_sources
+    stats.youtube_failed += youtube_stats.failed_sources
 
 
 def _is_youtube_only_normalized_document(meta: NormalizedMeta, text_path: Path) -> bool:
@@ -305,7 +376,7 @@ def _run_enrichment_job_with_retry(job: _EnrichmentJob, stats: EnrichmentStats) 
 def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | None:
     """Run the full enrichment pipeline for a single post."""
     normalized_text = job.txt_path.read_text(encoding="utf-8")
-    meta = NormalizedMeta.model_validate_json(job.meta_path.read_text(encoding="utf-8"))
+    meta = read_normalized_meta(job.txt_path)
     meta_data = meta.model_dump(mode="json")
 
     # 1. Content type classification (rule-based)
@@ -487,6 +558,9 @@ def _media_quality_flags(meta: NormalizedMeta) -> list[str]:
     """Return deterministic quality flags from native media metadata."""
     flags: list[str] = []
     for item in _media_entries(meta):
+        operations = item.get("analysis_operations")
+        if operations is not None and "transcribe" not in operations:
+            continue
         media_type = str(item.get("media_type") or "").strip().lower()
         if media_type not in {"video", "audio", "voice"}:
             continue
@@ -503,25 +577,30 @@ def _media_quality_issues(meta: NormalizedMeta) -> list[str]:
     """Return compact, non-secret media diagnostics for card provenance."""
     issues: list[str] = []
     for item in _media_entries(meta):
+        operations = item.get("analysis_operations")
+        if operations == []:
+            continue
         media_type = str(item.get("media_type") or "").strip().lower()
         message_id = str(item.get("message_id") or "unknown")
-        if media_type not in {"video", "audio", "voice", "image"}:
+        if media_type not in {"video", "audio", "voice", "image", "document"}:
             continue
         download_status = str(item.get("download_status") or "").strip().lower()
         if download_status and download_status != "downloaded":
             issues.append(f"media:{media_type}:{message_id}:download_{download_status}")
-        if media_type in {"video", "audio", "voice"} and download_status == "downloaded":
+        if media_type in {"video", "audio", "voice"} and download_status == "downloaded" and (operations is None or "transcribe" in operations):
             status = str(item.get("transcription_status") or "").strip().lower()
             if status not in {"transcribed", "no_speech"}:
                 issues.append(
                     f"media:{media_type}:{message_id}:transcription_{status or 'missing'}"
                 )
-        if media_type in {"image", "video"} and download_status == "downloaded":
+        if media_type in {"image", "video"} and download_status == "downloaded" and (operations is None or "vision" in operations):
             visual_status = str(item.get("visual_status") or "").strip().lower()
             if visual_status not in {"success", "unavailable"}:
                 issues.append(
                     f"media:{media_type}:{message_id}:visual_{visual_status or 'missing'}"
                 )
+        if media_type == "document" and item.get("text_extraction_status") != "success":
+            issues.append(f"media:document:{message_id}:text_{item.get('text_extraction_status') or 'missing'}")
     return issues
 
 
@@ -879,6 +958,8 @@ def _needs_enrichment(
     key: str,
     source_fingerprint: str,
 ) -> bool:
+    if key in progress.get("failed", {}):
+        return True
     prev = progress.get("enriched", {}).get(key)
     if prev is None:
         return True
@@ -906,9 +987,11 @@ def _migrate_non_media_contract(
 ) -> bool:
     """Stamp media-contract-v2 without an LLM call when a source has no media.
 
-    All semantic inputs and model identities must already match. A changed
+    All semantic inputs and valid provenance must already match. A changed
     fingerprint or any structural mismatch stays on the normal enrichment path.
     """
+    if key in progress.get("failed", {}):
+        return False
     prev = progress.get("enriched", {}).get(key)
     if not isinstance(prev, dict) or prev.get("source_fingerprint") != source_fingerprint:
         return False
@@ -930,6 +1013,8 @@ def _migrate_non_media_contract(
         or llm_backend.model_change_requires_regeneration(card.enrichment_model, "enrichment")
         or not expected_source_id
         or card.provenance.source_id != expected_source_id
+        or "extraction_unstable" in card.quality_flags
+        or not (card.summary.strip() or card.key_points)
     ):
         return False
     if card.media_contract_version != _MEDIA_CONTRACT_VERSION:
@@ -961,6 +1046,8 @@ def _is_valid_enriched_output(path: Path, expected_source_id: str | None) -> boo
     if not expected_source_id:
         return False
     if card.provenance.source_id != expected_source_id:
+        return False
+    if "extraction_unstable" in card.quality_flags or not (card.summary.strip() or card.key_points):
         return False
     return True
 

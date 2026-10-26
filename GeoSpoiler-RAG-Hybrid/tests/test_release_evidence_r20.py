@@ -5,7 +5,9 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -212,7 +214,8 @@ def test_windows_durable_replace_requests_write_through(
     target = tmp_path / "target"
     source.write_bytes(b"new")
     with (
-        patch.object(release_identity.os, "name", "nt"),
+        patch.object(release_identity, "os", SimpleNamespace(**{**vars(os), "name": "nt"})),
+        patch.object(release_identity, "pinned_directory", return_value=nullcontext(release_identity.PinnedDirectory(tmp_path, tmp_path))),
         patch.object(release_identity, "_windows_durable_replace") as replace,
     ):
         release_identity.durable_replace(source, target)
@@ -225,7 +228,7 @@ def test_windows_replace_flags_include_replace_and_write_through(
     source = tmp_path / "source"
     target = tmp_path / "target"
     source.write_bytes(b"new")
-    move = patch("ctypes.WinDLL")
+    move = patch("ctypes.WinDLL", create=True)
     with move as win_dll:
         api = win_dll.return_value.MoveFileExW
         api.return_value = 1
@@ -242,7 +245,7 @@ def test_durable_replace_preserves_committed_outcome(tmp_path: Path) -> None:
         directory_fd=123,
     )
     with (
-        patch.object(release_identity.os, "name", "posix"),
+        patch.object(release_identity, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
         patch.object(release_identity.os, "replace"),
         patch.object(release_identity.os, "fsync", side_effect=OSError("parent fsync")),
         pytest.raises(release_identity.ReleasePublicationCommittedError) as outcome,

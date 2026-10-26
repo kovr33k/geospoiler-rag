@@ -563,10 +563,18 @@ def _redact_sqlite_snapshot(
                 handle.flush()
                 os.fsync(handle.fileno())
         else:
-            source_path = parent.child(name)
+            # Open only the captured private copy. Closing a live WAL connection
+            # may checkpoint the original, and setconfig is unavailable on 3.11.
+            source_directory = staging / "source"
+            source_directory.mkdir()
+            for member_name, member_bytes in family.items():
+                with (source_directory / member_name).open("xb") as handle:
+                    handle.write(member_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            source_path = source_directory / name
             source = sqlite3.connect(source_path, timeout=0.0)
             try:
-                source.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
                 source.execute("BEGIN IMMEDIATE")
                 snapshot_bytes = source.serialize()
                 source.rollback()

@@ -73,6 +73,15 @@ telegram:{channel_id}:{message_id}
 The normal pipeline is:
 
 ```text
+cmd_run
+  -> cmd_fetch
+  -> bounded ready-material queue (default capacity 3)
+       normalization producer: save and validate text + metadata
+       enrichment workers: ordinary cards and dedicated YouTube generations
+       one result coordinator: publish cards + save enrichment progress
+  -> local card/segment FTS and source-registry refresh
+
+Standalone commands:
 cmd_fetch
   -> TelegramFetcher.fetch_all_channels
   -> list[TelegramMessage]
@@ -97,6 +106,15 @@ cmd_load
   -> enriched_v2 graph_text only
   -> data/indexes/lightrag/
 ```
+
+`run` starts enrichment as soon as a normalized material is completely saved.
+The queue applies backpressure and the worker pool shares the global Luna
+request limit with translation and media analysis. Fetch checkpoints advance
+only through the successfully normalized prefix of each channel. Failed
+enrichment remains discoverable from saved inputs and explicit failure state.
+Cancellation stops admission, drains accepted work and refreshes local indexes
+before returning; in-flight backend operations retain their normal timeouts.
+Graph loading remains an explicit command.
 
 `python main.py run` executes fetch, normalize, enrich, card FTS rebuild, and
 source-registry rebuild. LightRAG loading is a separate, explicit command.

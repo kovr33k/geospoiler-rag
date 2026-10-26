@@ -110,27 +110,34 @@ def enrich_youtube_all(
     *,
     channel_filter: str | None = None,
     force: bool = False,
+    metadata_paths: list[Path] | None = None,
+    legacy_meta_paths: list[Path] | None = None,
 ) -> YouTubeEnrichmentStats:
     """Enrich dedicated YouTube artifacts and legacy normalized YouTube posts."""
-    stats = YouTubeEnrichmentStats()
-    seen_keys: set[tuple[str, str]] = set()
     discovery_errors: list[tuple[Path, str]] = []
+    sources = _iter_youtube_sources(channel_filter=channel_filter, metadata_paths=metadata_paths,
+                                    legacy_meta_paths=legacy_meta_paths, seen_keys=set(), discovery_errors=discovery_errors)
+    return _enrich_youtube_sources(sources, force=force, discovery_errors=discovery_errors)
 
-    def iter_sources():
-        for source in _iter_dedicated_sources(channel_filter, discovery_errors):
-            key = _source_key(source)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                yield source
-        # Existing normalized YouTube posts predate timed artifacts. Read them
-        # as a no-cue fallback so regeneration does not lose the current corpus.
-        for source in _iter_legacy_sources(channel_filter, discovery_errors):
-            key = _source_key(source)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                yield source
 
-    for source in iter_sources():
+def _iter_youtube_sources(*, channel_filter, metadata_paths, legacy_meta_paths, seen_keys, discovery_errors):
+    for source in _iter_dedicated_sources(channel_filter, discovery_errors, metadata_paths):
+        key = _source_key(source)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            yield source
+    # Keep dedicated-source preference and occurrence identity across the
+    # entire stream, not a separate seen-set inside every worker invocation.
+    for source in _iter_legacy_sources(channel_filter, discovery_errors, legacy_meta_paths):
+        key = _source_key(source)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            yield source
+
+
+def _enrich_youtube_sources(sources, *, force: bool, discovery_errors) -> YouTubeEnrichmentStats:
+    stats = YouTubeEnrichmentStats()
+    for source in sources:
         stats.sources_scanned += 1
         try:
             result = _enrich_source(source, force=force)
@@ -708,11 +715,12 @@ def _segment_card_payload(card: YouTubeSegmentCardV2, spec: SegmentSpec) -> dict
 def _iter_dedicated_sources(
     channel_filter: str | None,
     discovery_errors: list[tuple[Path, str]] | None = None,
+    metadata_paths: list[Path] | None = None,
 ):
     root = config.YOUTUBE_NORMALIZED_DIR
     if not root.exists():
         return
-    for metadata_path in sorted(root.rglob("*.youtube.meta.json")):
+    for metadata_path in sorted(root.rglob("*.youtube.meta.json") if metadata_paths is None else metadata_paths):
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             default_stem = metadata_path.name.removesuffix(".meta.json")
@@ -742,11 +750,12 @@ def _iter_dedicated_sources(
 def _iter_legacy_sources(
     channel_filter: str | None,
     discovery_errors: list[tuple[Path, str]] | None = None,
+    metadata_paths: list[Path] | None = None,
 ):
     root = config.NORMALIZED_DIR
     if not root.exists():
         return
-    for meta_path in sorted(root.rglob("*.meta.json")):
+    for meta_path in sorted(root.rglob("*.meta.json") if metadata_paths is None else metadata_paths):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
             if not isinstance(metadata, dict):
@@ -1171,11 +1180,7 @@ def _source_fingerprint(source: dict, transcript: str) -> str:
         "schema_version": config.ENRICHMENT_SCHEMA_VERSION,
         "enrichment_prompt_version": config.ENRICHMENT_PROMPT_VERSION,
         "prompt_version": config.YOUTUBE_ENRICHMENT_PROMPT_VERSION,
-        "model": (
-            llm_backend.active_model_for("enrichment")
-            if config.REGENERATE_ON_PROFILE_CHANGE
-            else "profile-independent"
-        ),
+        "model": "profile-independent",
         "merge_max_chars": config.YOUTUBE_MERGE_MAX_CHARS,
         "segmentation_version": config.YOUTUBE_SEGMENTATION_VERSION,
         "segment_threshold_chars": SEGMENT_THRESHOLD_CHARS,

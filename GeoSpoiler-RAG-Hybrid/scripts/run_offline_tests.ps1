@@ -1,11 +1,14 @@
 param(
-    [string]$RunRoot = ""
+    [string]$RunRoot = "",
+    [string]$Python = ""
 )
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $projectRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python)) {
-    throw "Create .venv and install development dependencies before running offline tests."
+if (-not $Python) {
+    $Python = Join-Path $projectRoot $(if ($IsWindows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" })
+    if (-not (Test-Path -LiteralPath $Python)) {
+        throw "Create .venv and install development dependencies, or pass -Python, before running offline tests."
+    }
 }
 
 if (-not $RunRoot) {
@@ -19,8 +22,10 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:WIKI_ENABLED = "false"
 $env:HYBRID_QUERY_WIKI_ENABLED = "false"
+$env:PYTHONPATH = "$projectRoot$([IO.Path]::PathSeparator)$(Join-Path $projectRoot 'src')$([IO.Path]::PathSeparator)$env:PYTHONPATH"
 if (-not $env:TIKTOKEN_CACHE_DIR) {
-    $env:TIKTOKEN_CACHE_DIR = Join-Path $env:LOCALAPPDATA "GeoSpoiler\tiktoken"
+    $cacheRoot = if ($IsWindows) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
+    $env:TIKTOKEN_CACHE_DIR = Join-Path $cacheRoot "GeoSpoiler/tiktoken"
 }
 
 $paths = @{
@@ -44,5 +49,5 @@ foreach ($entry in $paths.GetEnumerator()) {
 }
 
 Write-Host "Offline test artifacts: $RunRoot"
-& $python -m pytest (Join-Path $projectRoot "tests") -q -rs --basetemp (Join-Path $RunRoot "pytest")
+& $Python -m pytest (Join-Path $projectRoot "tests") -q -rs --basetemp (Join-Path $RunRoot "pytest")
 exit $LASTEXITCODE

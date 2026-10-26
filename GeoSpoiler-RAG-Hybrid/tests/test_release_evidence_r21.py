@@ -7,6 +7,7 @@ import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -268,7 +269,7 @@ def test_posix_tree_fsyncs_nested_directories_bottom_up(tmp_path: Path) -> None:
         return next(descriptors)
 
     with (
-        patch.object(release_identity.os, "name", "posix"),
+        patch.object(release_identity, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
         patch.object(release_identity.os, "open", side_effect=record_open),
         patch.object(release_identity.os, "fsync"),
         patch.object(release_identity.os, "close"),

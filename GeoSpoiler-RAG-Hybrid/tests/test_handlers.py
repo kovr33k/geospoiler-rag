@@ -103,7 +103,7 @@ class HandlerTests(unittest.TestCase):
                     r"C:\WikiRag\RAG-GeoSpoiler\GeoSpoiler-RAG-Hybrid\media_cache\Channel\voice\msg_14.ogg"
                 )
 
-        self.assertEqual(resolved, active_file)
+        self.assertEqual(resolved, active_file.resolve())
 
     def test_canonicalize_instagram_url_rewrites_kk_host(self):
         url = "https://kkinstagram.com/reel/DVRCLW0DZT9/?igsh=cWI0ejYzYnZvMzVi"
@@ -740,6 +740,7 @@ class InstagramCacheTests(unittest.TestCase):
             self.assertIn("очеред", result.lower())
             self.assertNotIn("Old caption", result)
 
+    @patch("normalizer.instagram_handler.config.TRANSCRIPTION_API_KEY", "offline-test-key")
     def test_reel_with_caption_and_transcript_is_accepted_as_partial_success(self):
         info = {"description": "Caption", "uploader": "user", "duration": 10}
         with tempfile.TemporaryDirectory() as tmpdir:

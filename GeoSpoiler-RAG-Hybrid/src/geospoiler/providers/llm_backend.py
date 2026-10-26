@@ -38,9 +38,7 @@ _CODEX_MODEL_PREFIX = "codex-cli:"
 _PROCESS_TERMINATION_TIMEOUT_SECONDS = 5.0
 _codex_semaphore: threading.BoundedSemaphore | None = None
 _codex_semaphore_size: int | None = None
-_codex_async_semaphore: asyncio.Semaphore | None = None
-_codex_async_semaphore_size: int | None = None
-_codex_async_semaphore_loop: asyncio.AbstractEventLoop | None = None
+_codex_semaphore_lock = threading.Lock()
 
 
 class LLMBackendError(RuntimeError):
@@ -101,18 +99,12 @@ def active_model_for(role: str) -> str:
 
 
 def model_change_requires_regeneration(previous_model: str, role: str) -> bool:
-    """Respect the profile toggle without hiding same-backend model changes."""
-    if not str(previous_model or "").strip():
-        return True
-    current_model = active_model_for(role)
-    if previous_model == current_model:
-        return False
-    if not config.REGENERATE_ON_PROFILE_CHANGE:
-        previous_is_codex = str(previous_model).startswith(_CODEX_MODEL_PREFIX)
-        current_is_codex = current_model.startswith(_CODEX_MODEL_PREFIX)
-        if previous_is_codex != current_is_codex:
-            return False
-    return True
+    """Missing provenance is invalid; a different model is still valid provenance.
+
+    Keep the compatibility entry point. Source/schema/prompt validity and an
+    explicit force request are checked by the result owners, not model identity.
+    """
+    return not str(previous_model or "").strip()
 
 
 def complete_json_sync(
@@ -147,11 +139,9 @@ async def complete_text_async(
     validate_luna_configuration()
     prompt = _format_messages(messages, schema is not None)
     timeout = float(timeout_seconds or config.CODEX_LLM_TIMEOUT_SECONDS)
-    semaphore = _get_async_codex_semaphore()
-
     try:
         async with asyncio.timeout(timeout):
-            await semaphore.acquire()
+            semaphore = await _acquire_codex_semaphore_async()
             try:
                 with tempfile.TemporaryDirectory(
                     prefix="geospoiler-codex-",
@@ -335,6 +325,8 @@ async def _run_codex_async(
     prompt: str,
     output_path: Path,
 ) -> str:
+    if os.getenv("GEOSPOILER_NO_NETWORK", "").lower() in {"1", "true", "yes"}:
+        raise LLMBackendError("Codex subprocess calls are disabled in offline mode")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process_kwargs: dict[str, Any] = {
         "stdin": asyncio.subprocess.PIPE,
@@ -446,6 +438,8 @@ async def _run_async_termination_command(command: list[str]) -> None:
 
 
 def _run_codex(command: list[str], prompt: str, output_path: Path, timeout: float) -> str:
+    if os.getenv("GEOSPOILER_NO_NETWORK", "").lower() in {"1", "true", "yes"}:
+        raise LLMBackendError("Codex subprocess calls are disabled in offline mode")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process_kwargs: dict[str, Any] = {
         "stdin": subprocess.PIPE,
@@ -559,25 +553,24 @@ def _resolve_codex_executable() -> str | None:
 def _get_codex_semaphore() -> threading.BoundedSemaphore:
     global _codex_semaphore, _codex_semaphore_size
     size = max(1, int(config.CODEX_LLM_MAX_CONCURRENCY))
-    if _codex_semaphore is None or _codex_semaphore_size != size:
-        _codex_semaphore = threading.BoundedSemaphore(size)
-        _codex_semaphore_size = size
-    return _codex_semaphore
+    with _codex_semaphore_lock:
+        if _codex_semaphore is None or _codex_semaphore_size != size:
+            _codex_semaphore = threading.BoundedSemaphore(size)
+            _codex_semaphore_size = size
+        return _codex_semaphore
 
 
-def _get_async_codex_semaphore() -> asyncio.Semaphore:
-    global _codex_async_semaphore, _codex_async_semaphore_size, _codex_async_semaphore_loop
-    size = max(1, int(config.CODEX_LLM_MAX_CONCURRENCY))
-    loop = asyncio.get_running_loop()
-    if (
-        _codex_async_semaphore is None
-        or _codex_async_semaphore_size != size
-        or _codex_async_semaphore_loop is not loop
-    ):
-        _codex_async_semaphore = asyncio.Semaphore(size)
-        _codex_async_semaphore_size = size
-        _codex_async_semaphore_loop = loop
-    return _codex_async_semaphore
+async def _acquire_codex_semaphore_async() -> threading.BoundedSemaphore:
+    """Share sync/media permits without blocking the loop or orphaning a waiter.
+
+    A blocking acquire in an executor survives task cancellation and can take a
+    permit after its caller has gone. Nonblocking attempts keep acquisition and
+    the caller's release guard in the same task, including across event loops.
+    """
+    semaphore = _get_codex_semaphore()
+    while not semaphore.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    return semaphore
 
 
 def _format_messages(messages: Sequence[Mapping[str, Any]], structured: bool) -> str:

@@ -10,7 +10,7 @@ import shutil
 import socket
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -297,7 +297,14 @@ def _held_release_bundle_lock_on_path(
 def _held_release_bundle_lock(
     lock_path: Path, lock_payload: dict[str, Any]
 ) -> Iterator[None]:
-    with pinned_directory(lock_path.parent) as parent:
+    with ExitStack() as stack:
+        parent = None
+        try:
+            parent = stack.enter_context(pinned_directory(lock_path.parent))
+        except OSError:
+            pass
+        if parent is None:
+            raise FileExistsError("release evidence coordination lock unavailable")
         with _held_release_bundle_lock_on_path(parent.child(lock_path.name), lock_payload):
             yield
 

@@ -47,7 +47,7 @@ CODEX_LUNA_REASONING_EFFORT = (
     os.getenv("CODEX_LUNA_REASONING_EFFORT", "xhigh").strip().lower() or "xhigh"
 )
 CODEX_LLM_TIMEOUT_SECONDS = float(os.getenv("CODEX_LLM_TIMEOUT_SECONDS", "300"))
-CODEX_LLM_MAX_CONCURRENCY = max(1, int(os.getenv("CODEX_LLM_MAX_CONCURRENCY", "1")))
+CODEX_LLM_MAX_CONCURRENCY = max(1, int(os.getenv("CODEX_LLM_MAX_CONCURRENCY", "3")))
 CODEX_FALLBACK_TO_API = os.getenv("CODEX_FALLBACK_TO_API", "false").lower() == "true"
 REGENERATE_ON_PROFILE_CHANGE = (
     os.getenv("REGENERATE_ON_PROFILE_CHANGE", "false").lower() == "true"
@@ -235,6 +235,9 @@ STATE_DIR = PROJECT_ROOT / os.getenv("STATE_DIR", "./state")
 CODEX_RUNTIME_DIR = PROJECT_ROOT / os.getenv("CODEX_RUNTIME_DIR", "./state/codex_runtime")
 YOUTUBE_CHECKPOINT_DIR = STATE_DIR / "youtube_checkpoints"
 MEDIA_CACHE_DIR = PROJECT_ROOT / os.getenv("MEDIA_CACHE_DIR", "./media_cache")
+MEDIA_PROCESSING_MODE = os.getenv("MEDIA_PROCESSING_MODE", "selective").strip().lower()
+if MEDIA_PROCESSING_MODE not in {"selective", "all"}:
+    raise ValueError("MEDIA_PROCESSING_MODE must be selective or all")
 LOG_DIR = PROJECT_ROOT / os.getenv("LOG_DIR", "./logs")
 MEDIA_CAPTURE_ENABLED = os.getenv("MEDIA_CAPTURE_ENABLED", "true").lower() == "true"
 MEDIA_CAPTURE_MAX_BYTES = int(os.getenv("MEDIA_CAPTURE_MAX_BYTES", "0"))
@@ -279,7 +282,7 @@ YOUTUBE_SEGMENTATION_VERSION = "youtube_segmenter_v2"
 YOUTUBE_SEGMENT_SEARCH_TOP_K = int(os.getenv("YOUTUBE_SEGMENT_SEARCH_TOP_K", "200"))
 YOUTUBE_SEGMENT_HITS_PER_EPISODE = int(os.getenv("YOUTUBE_SEGMENT_HITS_PER_EPISODE", "10"))
 YOUTUBE_MERGE_MAX_CHARS = int(os.getenv("YOUTUBE_MERGE_MAX_CHARS", "48000"))
-ENRICHMENT_CONCURRENCY = int(os.getenv("ENRICHMENT_CONCURRENCY", str(max(1, LLM_MAX_ASYNC))))
+ENRICHMENT_CONCURRENCY = int(os.getenv("ENRICHMENT_CONCURRENCY", "3"))
 
 # ───────────────────────── LightRAG ─────────────────────────
 LIGHTRAG_ENTITY_TYPES = [

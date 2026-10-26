@@ -20,6 +20,7 @@ _MEDIA_PATTERNS = [
     re.compile(r"^\[Изображение(?:\s+\d+)?(?::.*?)?\]\s*$", re.IGNORECASE),
     re.compile(r"^\[Видео:.*?\]\s*$", re.IGNORECASE),
     re.compile(r"^\[Аудио:.*?\]\s*$", re.IGNORECASE),
+    re.compile(r"^\[Документ:.*?\]\s*$", re.IGNORECASE),
     re.compile(r"^\[Video transcript.*?\]\s*$", re.IGNORECASE),
     re.compile(r"^\[Photo\]\s*$", re.IGNORECASE),
     re.compile(r"^\[Media omitted\]\s*$", re.IGNORECASE),

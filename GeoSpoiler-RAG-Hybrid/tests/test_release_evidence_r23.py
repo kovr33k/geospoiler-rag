@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -179,7 +180,7 @@ def test_posix_publication_rejects_source_swap_inside_rename(tmp_path: Path) -> 
         return real_fstat(descriptor)
 
     with (
-        patch.object(release_identity.os, "name", "posix"),
+        patch.object(release_identity, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
         patch.object(release_identity.os, "stat", side_effect=fake_stat),
         patch.object(release_identity.os, "fstat", side_effect=fake_fstat),
         patch.object(

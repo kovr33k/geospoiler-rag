@@ -104,15 +104,21 @@ python main.py enrich --llm-profile luna
 python main.py query --llm-profile luna "What is the source saying about Taiwan?"
 ```
 
-Codex calls run through an isolated read-only CLI process with concurrency 1.
+Codex calls run through isolated read-only CLI processes with a shared limit of
+three calls across synchronous text, asynchronous text and Luna media analysis.
+Enrichment also defaults to three workers. Translation and enrichment share
+these permits; embeddings retain their separate concurrency policy.
 The configured reasoning effort is passed explicitly even though the isolated
 process ignores the user's global Codex configuration. The model identity
 stored in generated metadata includes the effort, for example
 `codex-cli:gpt-6-luna@xhigh`.
 API fallback is disabled by default (`CODEX_FALLBACK_TO_API=false`). Gemini
 transcription/Vision and Qwen embeddings remain separate OpenRouter-backed
-services. Switching between `current` and `luna` does not by itself force card regeneration;
-`REGENERATE_ON_PROFILE_CHANGE=true` enables that behavior.
+services. Changing model, profile or reasoning effort preserves valid cards and
+complete YouTube generations, including their original model provenance. Source,
+metadata, schema and processing-rule changes still invalidate affected results;
+explicit force remains available. The legacy `REGENERATE_ON_PROFILE_CHANGE`
+setting no longer invalidates a result solely because the model changed.
 
 The selected profile is also passed to the separate Streamlit Reviewer process,
 including when Reviewer is opened automatically after `run`. A live Luna check
@@ -186,12 +192,26 @@ command.
 
 ### Media and model boundaries
 
+`MEDIA_PROCESSING_MODE=selective` is the default for new ingestion. Caption rules
+choose operations before Telegram downloads, including photos and image documents.
+Self-contained text and vague/media-only posts retain attachment identity and an
+explicit `not_analyzed` status without downloading or analyzing the attachment.
+Explicit dependencies select image analysis, video frames, speech transcription,
+or local text/PDF extraction as needed. `all` is an explicit operator override.
+No per-post classifier model is added.
+
+Information only inside skipped media is absent from text search. Source links
+do not guarantee future availability; caption rules can miss important media.
+Local PDF extraction reads existing text; image-only/scanned documents without a
+text layer retain a diagnostic and require review. A policy skip is distinct
+from an error in selected processing. Query-time media analysis is not added.
+
 Text enrichment and final synthesis use Luna through the authenticated Codex
 CLI. Audio remains on Gemini with the configured Whisper fallback. Native image
 and video visual analysis uses the Luna media backend; it stores a status and a
-model/input-identity artifact in the normalized sidecar. A missing audio or
-visual branch is recorded as an explicit review condition and is never silently
-accepted as a caption-only success.
+model/input-identity artifact in the normalized sidecar. A failed selected
+operation retains diagnostics and is never presented as successful media
+extraction. Unselected operations remain explicitly unanalyzed.
 
 Instagram extraction checks the local `yt-dlp` against `YTDLP_MIN_VERSION`.
 Ordinary normalization can continue with a `degraded` latest-version check when
@@ -360,6 +380,14 @@ python scripts/late_fusion_ab.py --output-dir .\artifacts\late_fusion_ab --score
 ```
 
 ## When To Use `rebuild`
+
+Ordinary explicit `load` is incremental: matching successfully processed graph
+documents are reused, new documents are inserted and changed/incomplete/failed
+documents are retried with the same logical source identity. Source metadata is
+refreshed even on reuse. `load --force` explicitly reprocesses matching documents,
+including after extraction-rule changes. Missing local cards do not delete graph
+documents. Reported load totals count documents available after insertion/reuse;
+they do not imply that every document required a new extraction.
 
 `rebuild` is not for normal day-to-day runs. Use it only when you want to recreate LightRAG from current enriched v2 cards.
 

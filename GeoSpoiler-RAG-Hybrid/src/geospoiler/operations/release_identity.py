@@ -45,13 +45,15 @@ STATIC_ENVIRONMENT_PACKAGE_NAMES = (
     "aiofiles",
     "Pillow",
     "qrcode",
+    "pypdf",
+    "lingua-language-detector",
     "pre-commit",
     "pytest",
     "ruff",
 )
 STATIC_ENVIRONMENT_COMMAND_NAMES = ("python", "pytest", "ruff")
 DEPENDENCY_SPEC_RELATIVE_PATHS = ("pyproject.toml", "requirements.txt")
-TRUSTED_RELEASE_BASE_REF = "origin/master"
+TRUSTED_RELEASE_BASE_REF = "origin/main"
 RELEASE_TEST_TIMEOUT_SECONDS = 1800.0
 
 
@@ -96,7 +98,7 @@ RELEASE_PRODUCER_REGISTRY = (
         cli_probe_args=("{report}",),
     ),
     ReleaseProducerSpec("scripts/build_release_risk_register.py", "build_release_risk_register", ("release_risk_register_v1",), ("scripts/release_identity.py",), cli_probe_args=("--input", "{root}/input.json", "--output", "{report}", "--manifest", "{manifest}", "--release-run-id", "run-1")),
-    ReleaseProducerSpec("scripts/build_release_test_evidence.py", "build_release_test_evidence", ("release_test_gate_v1", "release_test_runner_lifecycle_v1", "release_test_runner_receipts_v1"), ("scripts/release_identity.py",), cli_probe_args=("--output", "{report}", "--base-ref", "origin/master")),
+    ReleaseProducerSpec("scripts/build_release_test_evidence.py", "build_release_test_evidence", ("release_test_gate_v1", "release_test_runner_lifecycle_v1", "release_test_runner_receipts_v1"), ("scripts/release_identity.py",), cli_probe_args=("--output", "{report}", "--base-ref", TRUSTED_RELEASE_BASE_REF)),
     ReleaseProducerSpec(
         "scripts/build_release_verification.py",
         "build_release_verification",
@@ -415,10 +417,19 @@ def _posix_pin_directory_chain(path: Path) -> tuple[list[int], int]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     descriptors: list[int] = []
-    descriptor = os.open(path.anchor or os.sep, flags | nofollow)
+    parts = path.parts[1:]
+    for base in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if path.is_relative_to(base):
+            suffix = path.relative_to(base).parts
+            if suffix and _is_open_directory_descriptor_alias(base / suffix[0]):
+                descriptor = os.dup(int(suffix[0]))
+                parts = suffix[1:]
+                break
+    else:
+        descriptor = os.open(path.anchor or os.sep, flags | nofollow)
     descriptors.append(descriptor)
     try:
-        for part in path.parts[1:]:
+        for part in parts:
             descriptor = os.open(part, flags | nofollow, dir_fd=descriptor)
             descriptors.append(descriptor)
     except Exception:
@@ -1735,8 +1746,9 @@ def _read_stable_file_bytes(path: Path) -> bytes:
 
 def _artifact_tree_snapshot(root: Path) -> list[dict[str, Any]]:
     """Capture one analyzed namespace/content snapshot without split reads."""
-    root_before = root.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(root_before.st_mode) or _path_is_link_or_reparse(root):
+    descriptor_alias = _is_open_directory_descriptor_alias(root)
+    root_before = root.stat(follow_symlinks=descriptor_alias)
+    if not stat.S_ISDIR(root_before.st_mode) or (not descriptor_alias and _path_is_link_or_reparse(root)):
         raise RuntimeError("artifact tree root boundary violation")
     records: list[dict[str, Any]] = [
         {
@@ -1774,7 +1786,7 @@ def _artifact_tree_snapshot(root: Path) -> list[dict[str, Any]]:
                 "data": data,
             }
         )
-    root_after = root.stat(follow_symlinks=False)
+    root_after = root.stat(follow_symlinks=descriptor_alias)
     if _stable_stat_identity(root_before) != _stable_stat_identity(root_after):
         raise RuntimeError("artifact tree root changed during snapshot")
     return records

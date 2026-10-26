@@ -19,6 +19,7 @@ from telethon.tl.types import Channel, MessageMediaDocument, MessageMediaPhoto
 
 from geospoiler import config
 from geospoiler.ingestion.fetcher.state import get_last_message_id
+from geospoiler.ingestion.normalizer.media_selection import media_operations
 
 logger = logging.getLogger("geospoiler.fetcher")
 
@@ -33,6 +34,11 @@ class TelegramMedia:
     file_path: str = ""
     download_status: str = "not_attempted"
     error: str = ""
+    attachment_id: str = ""
+    analysis_operations: list[str] | None = None
+    selection_reason: str = ""
+    text_extraction_status: str = ""
+    text_extraction_error: str = ""
 
 
 @dataclass
@@ -281,74 +287,46 @@ class TelegramFetcher:
                 tg_msg.forward_from_name = fwd.from_name
             tg_msg.forward_date = fwd.date
 
-        # Process media for each message in group
+        # Decide from the combined caption and attachment identity before IO.
         for m in messages:
             if isinstance(m.media, MessageMediaPhoto):
-                # Download image
-                img_path = await self._download_image(m, channel)
-                if img_path:
-                    tg_msg.image_paths.append(img_path)
-                    tg_msg.media.append(TelegramMedia(
-                        media_type="image",
-                        message_id=m.id,
-                        file_path=img_path,
-                        download_status="downloaded",
-                    ))
+                media_type, mime = "image", "image/jpeg"
+                attachment = getattr(m.media, "photo", None)
+            elif isinstance(m.media, MessageMediaDocument) and m.media.document:
+                attachment = m.media.document
+                media_type = _document_media_type(attachment)
+                mime = getattr(attachment, "mime_type", "") or ""
+            else:
+                continue
+            tg_msg.has_video |= media_type == "video"
+            tg_msg.has_voice |= media_type in {"audio", "voice"}
+            tg_msg.has_document |= media_type == "document"
+            operations = media_operations(combined_text, media_type)
+            record = TelegramMedia(media_type=media_type, mime_type=mime, message_id=m.id,
+                                   attachment_id=str(getattr(attachment, "id", "") or ""),
+                                   analysis_operations=operations,
+                                   selection_reason="explicit_dependency" if operations else "no_explicit_dependency")
+            if not operations:
+                record.download_status = "not_analyzed"
+            elif media_type == "image":
+                if not config.MEDIA_CAPTURE_ENABLED:
+                    record.download_status = "disabled"
+                    record.error = "MEDIA_CAPTURE_ENABLED=false"
                 else:
-                    tg_msg.media.append(TelegramMedia(
-                        media_type="image",
-                        message_id=m.id,
-                        download_status="failed",
-                        error="download_failed",
-                    ))
-            elif isinstance(m.media, MessageMediaDocument):
-                doc = m.media.document
-                if doc:
-                    mime = getattr(doc, "mime_type", "") or ""
-                    media_type = _document_media_type(doc)
-                    if media_type == "video":
-                        tg_msg.has_video = True
-                        tg_msg.media.append(await self._download_native_media(
-                            m,
-                            channel,
-                            media_type=media_type,
-                            mime_type=mime,
-                        ))
-                    elif media_type in {"audio", "voice"}:
-                        tg_msg.has_voice = True
-                        tg_msg.media.append(await self._download_native_media(
-                            m,
-                            channel,
-                            media_type=media_type,
-                            mime_type=mime,
-                        ))
-                    elif media_type == "image":
-                        img_path = await self._download_image(m, channel)
-                        if img_path:
-                            tg_msg.image_paths.append(img_path)
-                            tg_msg.media.append(TelegramMedia(
-                                media_type="image",
-                                mime_type=mime,
-                                message_id=m.id,
-                                file_path=img_path,
-                                download_status="downloaded",
-                            ))
-                        else:
-                            tg_msg.media.append(TelegramMedia(
-                                media_type="image",
-                                mime_type=mime,
-                                message_id=m.id,
-                                download_status="failed",
-                                error="download_failed",
-                            ))
+                    image_path = await self._download_image(m, channel)
+                    if image_path:
+                        record.file_path = image_path
+                        record.download_status = "downloaded"
+                        tg_msg.image_paths.append(image_path)
                     else:
-                        tg_msg.has_document = True
-                        tg_msg.media.append(TelegramMedia(
-                            media_type="document",
-                            mime_type=mime,
-                            message_id=m.id,
-                            download_status="not_attempted",
-                        ))
+                        record.download_status = "failed"
+                        record.error = "download_failed"
+            else:
+                downloaded = await self._download_native_media(m, channel, media_type, mime)
+                record.file_path = downloaded.file_path
+                record.download_status = downloaded.download_status
+                record.error = downloaded.error
+            tg_msg.media.append(record)
 
         # Extract URLs from text
         if combined_text:

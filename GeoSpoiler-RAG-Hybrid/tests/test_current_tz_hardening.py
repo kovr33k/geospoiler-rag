@@ -230,6 +230,7 @@ class CurrentTzHardeningTests(unittest.TestCase):
                 "enriched_at": "2026-01-01T00:00:0000:00",
                 "provenance": {"source_id": source_id},
                 "content_type": "telegram_post",
+                "summary": "Источник сообщил о переговорах.",
             }
             card_path.write_text(json.dumps(card), encoding="utf-8")
             progress = {

@@ -1,6 +1,9 @@
 import logging
+import re
+from functools import lru_cache
 
 import requests
+from lingua import Language, LanguageDetectorBuilder
 
 from geospoiler import config
 from geospoiler.providers import llm_backend
@@ -16,12 +19,51 @@ Preserve all original meaning, entities, quotes, formatting, and tone.
 DO NOT add any conversational filler like 'Here is the translation'. Output ONLY the final Russian text."""
 
 
+@lru_cache(maxsize=1)
+def _russian_detector():
+    return LanguageDetectorBuilder.from_languages(Language.RUSSIAN, Language.UKRAINIAN, Language.BULGARIAN).build()
+
+
+def is_confidently_russian(text: str) -> bool:
+    """Conservative local bypass; unknown and mixed prose still reaches translation.
+
+    Require local Russian confidence against Ukrainian/Bulgarian, not just
+    Cyrillic. Check clauses separately so a Russian introduction cannot mask a
+    foreign continuation. Very short and ambiguous fragments retain translation.
+    """
+    candidate = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    candidate = re.sub(
+        r"(?m)^\[(?:(?:Изображение|Видео|Аудио|Документ):[^\n]*|Изображение|Текст с экрана \(OCR\)|Текст документа|(?:Video |Voice )?[Tt]ranscript[^\n]*)\]\s*$",
+        "", candidate,
+    )
+    found_prose = False
+    for sentence in re.split(r"[.!?,;:\n]+", candidate):
+        words = re.findall(r"[^\W\d_]+", sentence, re.UNICODE)
+        if not words:
+            continue
+        acronyms = [word for word in words if word.isascii() and word.isupper() and len(word) <= 5]
+        if len(acronyms) > 1:
+            return False
+        words = [word for word in words if word not in acronyms]
+        if len(words) < 3:
+            return False
+        found_prose = True
+        if any(not re.fullmatch(r"[а-яё]+", word.casefold()) for word in words):
+            return False
+        confidence = _russian_detector().compute_language_confidence_values(" ".join(words))[0]
+        if confidence.language != Language.RUSSIAN or confidence.value < 0.95:
+            return False
+    return found_prose
+
+
 def translate_to_russian_if_needed(text: str) -> str:
     """
     Translates the text to Russian using the configured LLM,
     or leaves it unchanged if it is already in Russian.
     """
     if not text or not text.strip():
+        return text
+    if is_confidently_russian(text):
         return text
 
     messages = [
