@@ -200,7 +200,7 @@ class EnrichedV2ProvenanceTests(unittest.TestCase):
                 inserted = asyncio.run(ingest.load_from_enriched(rag, enriched_dir))
 
         self.assertEqual(inserted, 1)
-        load_texts.assert_awaited_once_with(rag, [("current.txt", "current graph")])
+        load_texts.assert_awaited_once_with(rag, [("current.txt", "current graph")], reuse_processed=True)
 
     def test_lightrag_loader_never_falls_back_to_normalized_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:

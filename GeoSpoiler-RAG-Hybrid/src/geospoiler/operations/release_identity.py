@@ -45,13 +45,15 @@ STATIC_ENVIRONMENT_PACKAGE_NAMES = (
     "aiofiles",
     "Pillow",
     "qrcode",
+    "pypdf",
+    "lingua-language-detector",
     "pre-commit",
     "pytest",
     "ruff",
 )
 STATIC_ENVIRONMENT_COMMAND_NAMES = ("python", "pytest", "ruff")
 DEPENDENCY_SPEC_RELATIVE_PATHS = ("pyproject.toml", "requirements.txt")
-TRUSTED_RELEASE_BASE_REF = "origin/master"
+TRUSTED_RELEASE_BASE_REF = "origin/main"
 RELEASE_TEST_TIMEOUT_SECONDS = 1800.0
 
 
@@ -96,7 +98,7 @@ RELEASE_PRODUCER_REGISTRY = (
         cli_probe_args=("{report}",),
     ),
     ReleaseProducerSpec("scripts/build_release_risk_register.py", "build_release_risk_register", ("release_risk_register_v1",), ("scripts/release_identity.py",), cli_probe_args=("--input", "{root}/input.json", "--output", "{report}", "--manifest", "{manifest}", "--release-run-id", "run-1")),
-    ReleaseProducerSpec("scripts/build_release_test_evidence.py", "build_release_test_evidence", ("release_test_gate_v1", "release_test_runner_lifecycle_v1", "release_test_runner_receipts_v1"), ("scripts/release_identity.py",), cli_probe_args=("--output", "{report}", "--base-ref", "origin/master")),
+    ReleaseProducerSpec("scripts/build_release_test_evidence.py", "build_release_test_evidence", ("release_test_gate_v1", "release_test_runner_lifecycle_v1", "release_test_runner_receipts_v1"), ("scripts/release_identity.py",), cli_probe_args=("--output", "{report}", "--base-ref", TRUSTED_RELEASE_BASE_REF)),
     ReleaseProducerSpec(
         "scripts/build_release_verification.py",
         "build_release_verification",

@@ -5,7 +5,13 @@ from loader.manifest_contract import validate_manifest_payload
 from scripts import build_release_verification
 from scripts.build_release_evidence import _safe_staging_file
 from scripts.build_release_verification import _evidence_bundle, _smoke_is_strict, _test_evidence
-from scripts.release_identity import canonical_json, sha256_bytes, strict_json_loads, validate_report_envelope
+from scripts.release_identity import (
+    TRUSTED_RELEASE_BASE_REF,
+    canonical_json,
+    sha256_bytes,
+    strict_json_loads,
+    validate_report_envelope,
+)
 
 
 def test_strict_json_loader_rejects_duplicate_keys() -> None:
@@ -89,7 +95,7 @@ def test_verifier_rejects_fake_exact_release_commands(tmp_path: Path) -> None:
     summary = {"gates_passed": 4, "gates_failed": 0, "timeouts": 0, "commands": [], "pytest_counts": {"parsed": True, "passed": 1, "failed": 0, "skipped": 0}}
     payload = {"release_schema_version": "release_evidence_v1", "status": "passed", "summary": summary,
                "summary_path": str(tmp_path / "summary.json"), "summary_sha256": "0" * 64,
-               "checks": checks, "base_ref": "origin/master", "base_commit": "a", "merge_base": "b", "head_commit": "c",
+               "checks": checks, "base_ref": TRUSTED_RELEASE_BASE_REF, "base_commit": "a", "merge_base": "b", "head_commit": "c",
                "diff_check_argv": ["git", "diff", "--check", "b..HEAD", "--"]}
     summary_path = tmp_path / "summary.json"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")

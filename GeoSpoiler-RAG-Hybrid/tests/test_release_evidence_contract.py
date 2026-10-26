@@ -15,6 +15,7 @@ from scripts.release_identity import (
     REPORT_CONTRACTS,
     STATIC_ENVIRONMENT_COMMAND_NAMES,
     STATIC_ENVIRONMENT_PACKAGE_NAMES,
+    TRUSTED_RELEASE_BASE_REF,
     build_identity,
     canonical_json,
     config_identity_sha256,
@@ -178,7 +179,7 @@ def _fixture_test_report(tmp_path: Path) -> dict:
 
 def _release_fixture_reports(tmp_path: Path, manifest: Path, identity: dict) -> list[tuple[str, Path]]:
     test_report = _fixture_test_report(tmp_path)
-    test_report.update({"base_ref": "origin/master", "base_commit": "a", "merge_base": "b", "head_commit": "c", "diff_check_argv": ["git", "diff", "--check", "b..HEAD", "--"]})
+    test_report.update({"base_ref": TRUSTED_RELEASE_BASE_REF, "base_commit": "a", "merge_base": "b", "head_commit": "c", "diff_check_argv": ["git", "diff", "--check", "b..HEAD", "--"]})
     test_report = stamp_report(test_report, identity, "python fixture", producer=REPORT_CONTRACTS["tests"]["producer"], producer_schema_version=REPORT_CONTRACTS["tests"]["schema_version"], source_inputs={"manifest_sha256": identity["manifest_sha256"], "corpus_identity_sha256": identity["corpus_identity_sha256"]}, command_argv=["python", "fixture"])
     reports: list[tuple[str, Path]] = [("tests", tmp_path / "tests.json")]
     reports[0][1].write_text(json.dumps(test_report), encoding="utf-8")

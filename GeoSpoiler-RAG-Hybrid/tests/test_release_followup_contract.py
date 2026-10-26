@@ -158,6 +158,7 @@ def test_release_smoke_exception_persists_derived_attempt_ledger(tmp_path: Path)
     )
     output = tmp_path / "attempt-001" / "smoke.json"
     with (
+        patch.object(late_fusion_activation_smoke.config, "LATE_FUSION_ENABLED", True),
         patch.object(late_fusion_activation_smoke, "create_rag", new=AsyncMock(side_effect=RuntimeError("boom"))),
         patch.object(
             late_fusion_activation_smoke,
