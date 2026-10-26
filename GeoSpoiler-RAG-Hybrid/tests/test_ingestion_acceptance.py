@@ -342,12 +342,15 @@ def test_incomplete_saved_pair_cannot_publish_card(ingestion_runtime, monkeypatc
     assert ingestion_runtime == []
 
 
-def test_interrupted_legacy_pair_overwrite_never_accepts_mixed_provenance(ingestion_runtime, monkeypatch):
+@pytest.mark.parametrize("existing_text", [True, False])
+def test_interrupted_legacy_pair_overwrite_never_accepts_mixed_provenance(ingestion_runtime, monkeypatch, existing_text):
     path = _save_normalized(message(RUSSIAN), "Original text", {"channel_id": 123, "message_id": 1, "date": "2026-01-01"})
     meta_path = path.with_suffix(".meta.json")
     old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     old_meta.pop("normalized_text_sha256")
     meta_path.write_text(json.dumps(old_meta), encoding="utf-8")
+    if not existing_text:
+        path.unlink()
     real_replace = os.replace
 
     def interrupt(path, target):
@@ -359,9 +362,17 @@ def test_interrupted_legacy_pair_overwrite_never_accepts_mixed_provenance(ingest
         fault.setattr(os, "replace", interrupt)
         with pytest.raises(KeyboardInterrupt):
             _save_normalized(message(RUSSIAN), "Replacement text", {**old_meta, "date": "2026-10-25"})
-    accepted = read_normalized_meta(path)
-    assert path.read_text(encoding="utf-8") == "Original text"
-    assert accepted.date == "2026-01-01"
+    if existing_text:
+        accepted = read_normalized_meta(path)
+        assert path.read_text(encoding="utf-8") == "Original text"
+        assert accepted.date == "2026-01-01"
+    else:
+        with pytest.raises(ValueError, match="Empty normalized text"):
+            read_normalized_meta(path)
+        assert json.loads(meta_path.read_text(encoding="utf-8")) == old_meta
+        _save_normalized(message(RUSSIAN), "Replacement text", {**old_meta, "date": "2026-10-25"})
+        assert read_normalized_meta(path).date == "2026-10-25"
+        assert path.read_text(encoding="utf-8") == "Replacement text"
 
 
 def test_stream_checkpoint_io_grows_linearly(ingestion_runtime, monkeypatch):

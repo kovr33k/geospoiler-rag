@@ -683,9 +683,12 @@ def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = No
         metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
         meta_path = filepath.with_suffix(".meta.json")
         recover_atomic_pair(filepath, meta_path, journal_suffix="normalized")
-        if filepath.is_file() and meta_path.is_file():
+        if meta_path.is_file():
+            # A legacy sidecar may survive without its text. Roll back to empty
+            # input in that case so recovery cannot accept new text as old data.
             atomic_write_pair(filepath, text_bytes, meta_path, metadata_bytes,
-                              original_first=filepath.read_bytes(), original_second=meta_path.read_bytes(),
+                              original_first=filepath.read_bytes() if filepath.is_file() else b"",
+                              original_second=meta_path.read_bytes(),
                               journal_suffix="normalized")
             return filepath
     atomic_write_bytes(filepath, text_bytes)
