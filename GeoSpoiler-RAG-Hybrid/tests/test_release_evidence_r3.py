@@ -961,6 +961,7 @@ def test_bundle_recovers_malformed_metadata_after_kernel_lock(tmp_path: Path, mo
     assert json.loads(receipts[0].read_text(encoding="utf-8"))["reason"] == "malformed_lock_metadata_recovered"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing mode prevents unlink of the locked file")
 def test_bundle_kernel_lock_prevents_replacing_coordination_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -103,7 +103,7 @@ class HandlerTests(unittest.TestCase):
                     r"C:\WikiRag\RAG-GeoSpoiler\GeoSpoiler-RAG-Hybrid\media_cache\Channel\voice\msg_14.ogg"
                 )
 
-        self.assertEqual(resolved, active_file)
+        self.assertEqual(resolved, active_file.resolve())
 
     def test_canonicalize_instagram_url_rewrites_kk_host(self):
         url = "https://kkinstagram.com/reel/DVRCLW0DZT9/?igsh=cWI0ejYzYnZvMzVi"

@@ -152,6 +152,7 @@ def test_wiki_off_commands_and_search_do_not_open_or_create_state(tmp_path, monk
     monkeypatch.setattr(config, "WIKI_OUTPUT_DIR", tmp_path / "wiki-projections")
     monkeypatch.setattr(config, "WIKI_SIDECAR_DIR", tmp_path / "wiki-sidecars")
     monkeypatch.setattr(cli_app, "setup_logging", lambda: None)
+    monkeypatch.setattr(cli_app.llm_backend, "validate_luna_configuration", lambda: None)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Wiki-off route opened a database")

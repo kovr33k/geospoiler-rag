@@ -14,6 +14,20 @@ import pytest
 from scripts import release_identity, security_artifact_redaction, security_release_scan
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor alias contract")
+def test_nested_pinned_alias_retains_identity_and_rejects_child_links(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (tmp_path / "link").symlink_to(nested, target_is_directory=True)
+    with release_identity.pinned_directory(tmp_path) as parent:
+        with release_identity.pinned_directory(parent.child("nested")) as child:
+            release_identity.atomic_write_bytes_in_directory(child, "saved.txt", b"retained")
+        with pytest.raises(OSError):
+            with release_identity.pinned_directory(parent.child("link")):
+                pytest.fail("pinned child symlink was followed")
+    assert (nested / "saved.txt").read_bytes() == b"retained"
+
+
 def _wal_database(path: Path) -> None:
     code = r"""
 import os
@@ -97,7 +111,8 @@ def test_posix_publication_rejects_source_fd_identity_mismatch(tmp_path: Path) -
     changed = SimpleNamespace(st_dev=1, st_ino=3, st_mode=0o040755)
 
     with (
-        patch.object(release_identity.os, "name", "posix"),
+        patch.object(release_identity, "os", SimpleNamespace(**{**vars(os), "name": "posix"})),
+        patch.object(type(target), "exists", return_value=False),
         patch.object(release_identity, "_artifact_tree_inventory_sha256", return_value="sealed"),
         patch.object(release_identity.os, "stat", return_value=changed),
         patch.object(release_identity, "_posix_rename_noreplace") as rename,

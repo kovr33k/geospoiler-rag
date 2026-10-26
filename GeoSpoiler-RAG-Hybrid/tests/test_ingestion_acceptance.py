@@ -54,6 +54,7 @@ def ingestion_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(enrichment, "_PROGRESS_FILE", config.STATE_DIR / "enrichment_progress.json")
     monkeypatch.setattr(config, "WIKI_ENABLED", False)
     monkeypatch.setattr(config, "LLM_PROFILE", "luna")
+    monkeypatch.setattr(llm_backend, "validate_luna_configuration", lambda: None)
     monkeypatch.setattr(cli, "rebuild_card_index", partial(rebuild_card_index, config.ENRICHED_DIR, config.CARD_FTS_DB_PATH))
     monkeypatch.setattr(cli, "rebuild_youtube_segment_index", partial(
         rebuild_youtube_segment_index, config.YOUTUBE_SEGMENTS_DIR, config.CARD_FTS_DB_PATH))

@@ -178,6 +178,7 @@ def test_main_load_manifest_path_is_resolved_before_rag_creation() -> None:
     create_rag = AsyncMock()
 
     with (
+        patch.object(cli_app.llm_backend, "validate_luna_configuration"),
         patch.object(Path, "resolve", side_effect=OSError(marker)),
         patch.object(cli_pipeline, "create_rag", new=create_rag),
         pytest.raises(Exception) as caught,

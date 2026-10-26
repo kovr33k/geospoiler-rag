@@ -417,10 +417,19 @@ def _posix_pin_directory_chain(path: Path) -> tuple[list[int], int]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     descriptors: list[int] = []
-    descriptor = os.open(path.anchor or os.sep, flags | nofollow)
+    parts = path.parts[1:]
+    for base in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if path.is_relative_to(base):
+            suffix = path.relative_to(base).parts
+            if suffix and _is_open_directory_descriptor_alias(base / suffix[0]):
+                descriptor = os.dup(int(suffix[0]))
+                parts = suffix[1:]
+                break
+    else:
+        descriptor = os.open(path.anchor or os.sep, flags | nofollow)
     descriptors.append(descriptor)
     try:
-        for part in path.parts[1:]:
+        for part in parts:
             descriptor = os.open(part, flags | nofollow, dir_fd=descriptor)
             descriptors.append(descriptor)
     except Exception:
@@ -1737,8 +1746,9 @@ def _read_stable_file_bytes(path: Path) -> bytes:
 
 def _artifact_tree_snapshot(root: Path) -> list[dict[str, Any]]:
     """Capture one analyzed namespace/content snapshot without split reads."""
-    root_before = root.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(root_before.st_mode) or _path_is_link_or_reparse(root):
+    descriptor_alias = _is_open_directory_descriptor_alias(root)
+    root_before = root.stat(follow_symlinks=descriptor_alias)
+    if not stat.S_ISDIR(root_before.st_mode) or (not descriptor_alias and _path_is_link_or_reparse(root)):
         raise RuntimeError("artifact tree root boundary violation")
     records: list[dict[str, Any]] = [
         {
@@ -1776,7 +1786,7 @@ def _artifact_tree_snapshot(root: Path) -> list[dict[str, Any]]:
                 "data": data,
             }
         )
-    root_after = root.stat(follow_symlinks=False)
+    root_after = root.stat(follow_symlinks=descriptor_alias)
     if _stable_stat_identity(root_before) != _stable_stat_identity(root_after):
         raise RuntimeError("artifact tree root changed during snapshot")
     return records

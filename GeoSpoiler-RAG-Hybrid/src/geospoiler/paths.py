@@ -66,7 +66,7 @@ def _layout():
 def resolve_project_path(value: str | Path) -> Path:
     """Resolve persisted old/new addresses to the active physical data tree."""
     config, layout = _layout()
-    path = Path(value)
+    path = Path(str(value).replace("\\", "/"))
     if not path.is_absolute():
         path = config.PROJECT_ROOT / path
     if layout is None:

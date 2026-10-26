@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from geospoiler import config
 
@@ -29,12 +29,12 @@ def resolve_media_path(value: str | Path | None) -> Path:
     raw = str(value or "").strip()
     if not raw:
         raise MediaPathError("missing_media_path")
-    path = Path(raw)
+    path = Path(raw.replace("\\", "/"))
     if any(part in {"", ".", ".."} for part in path.parts):
         raise MediaPathError("media_path_traversal")
 
     cache_root = config.MEDIA_CACHE_DIR.resolve()
-    if path.is_absolute():
+    if path.is_absolute() or PureWindowsPath(raw).is_absolute():
         try:
             candidate = path.resolve()
             candidate.relative_to(cache_root)

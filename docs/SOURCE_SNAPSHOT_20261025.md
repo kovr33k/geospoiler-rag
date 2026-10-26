@@ -1,6 +1,8 @@
 # Source snapshot, 25 October 2026
 
-Active private repository: `kovr33k/geospoiler-rag`, branch `main`.
+Repository: `kovr33k/geospoiler-rag`, branch `main`. It was initialized private;
+the user explicitly requested public visibility on 26 October 2026 so standard
+GitHub-hosted Actions runners can execute without private-repository minute charges.
 The application remains in `GeoSpoiler-RAG-Hybrid/`.
 
 This is a new history built from the working files at
