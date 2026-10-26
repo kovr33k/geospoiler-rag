@@ -1,6 +1,6 @@
 # Актуальные требования
 
-- [Задачи по спецификации RAG](rag-ingestion-tickets-20261025/README.md) — №2 и №4–9 реализованы в `codex/ingestion-ready-materials` нового приватного репозитория; целевые проверки пройдены. Итоговое review и полная offline-регрессия выполняются отдельно.
+- [Задачи по спецификации RAG](rag-ingestion-tickets-20261025/README.md) — №2 и №4–9 реализованы в `codex/ingestion-ready-materials` нового приватного репозитория. [Итоговый отчёт](../INGESTION_IMPLEMENTATION_EVIDENCE_20261026.md): независимое review без P0/P1/P2, полный offline-набор — 1250 passed, 4 skipped, 44 subtests passed; Ruff пройден.
 - [Спецификация: заливка RAG и GitHub](RAG_INGESTION_AND_GITHUB_SPEC_20261025.md) — опубликована в [issue №1](https://github.com/kovr33k/geospoiler-rag/issues/1) и остаётся открытой. №3 ожидает фактического успешного CI Windows/Linux: Actions не запускает шаги из-за ограничения оплаты/расходов. №10 заблокирован; реальная выборка медиа, итоговая приёмка и архивация старых репозиториев ещё не выполнены. Актуальный статус и доказательства — в GitHub issues.
 - [Согласованные изменения загрузки материалов](INGESTION_SPEED_DECISIONS_20261025.md) — согласованы все шесть пунктов; отдельно перечислены незакрытые замечания аудита, включая контекст при ответах.
 - [Миграция структуры](../PROJECT_STRUCTURE_MIGRATION_TZ_20260909.md).
