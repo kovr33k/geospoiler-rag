@@ -42,3 +42,12 @@ valid check. No working graph or source corpus is modified by this transfer.
 
 The two old RAG repositories remain available. Archiving them is conditional on
 the verified final cutover in issue 10.
+
+## Cutover update, 26 October 2026
+
+PR #11 is merged into the new `main`; hosted Windows/Linux CI and the bounded
+real acceptance cycle passed. The owner confirmed deleting the former public
+repository. Its history remains reachable from the private backup; the remaining
+`geospoiler-rag-hybrid-backup` is now archived. Original local files and data remain
+in place. See the application's final ingestion acceptance report for evidence
+and the local launcher route.

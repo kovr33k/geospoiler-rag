@@ -2,6 +2,8 @@
 
 Telegram-to-RAG pipeline for collecting posts, normalizing linked content, and loading a LightRAG knowledge base you can query locally.
 
+Итог текущего перехода: [приёмка заливки и рабочего маршрута](docs/INGESTION_ACCEPTANCE_20261026.md). Изменения находятся в `main`; отчёт разделяет реальную проверку, ограничения выборочного медиа и исторические результаты.
+
 ## What It Does
 
 The pipeline can:
