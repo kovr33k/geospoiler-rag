@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "GeoSpoiler RAG — архитектура верхнего уровня",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 660]
+  },
+  "components": [
+    { "id": "sources", "type": "external", "label": "Источники", "sublabel": "Telegram · ссылки · медиа", "pos": [55, 70], "size": [165, 72] },
+    { "id": "fetch", "type": "backend", "label": "Получение", "sublabel": "Telegram fetcher", "pos": [275, 70], "size": [165, 72] },
+    { "id": "normalize", "type": "backend", "label": "Нормализация", "sublabel": "текст · медиа · транскрипты", "pos": [495, 70], "size": [190, 72] },
+    { "id": "archive", "type": "database", "label": "Архив источников", "sublabel": "data/normalized", "pos": [740, 70], "size": [175, 72] },
+    { "id": "enrich", "type": "backend", "label": "Создание карточек", "sublabel": "enrich: факты · тезисы", "pos": [970, 70], "size": [190, 72] },
+    { "id": "cards", "type": "database", "label": "Карточки v2", "sublabel": "data/enriched", "pos": [1200, 70], "size": [155, 72] },
+    { "id": "fts", "type": "database", "label": "FTS + источники", "sublabel": "SQLite · YouTube-сегменты", "pos": [1165, 275], "size": [220, 76] },
+    { "id": "graph", "type": "database", "label": "LightRAG", "sublabel": "граф + векторный поиск", "pos": [860, 275], "size": [205, 76] },
+    { "id": "interface", "type": "frontend", "label": "CLI", "sublabel": "run · load · query/search", "pos": [95, 495], "size": [205, 76] },
+    { "id": "answer", "type": "backend", "label": "Answering", "sublabel": "Late Fusion · цитаты", "pos": [535, 495], "size": [205, 76] },
+    { "id": "providers", "type": "external", "label": "LLM и модели", "sublabel": "Codex/API · embedding · vision", "pos": [1030, 495], "size": [240, 76] }
+  ],
+  "connections": [
+    { "from": "sources", "to": "fetch", "variant": "emphasis" },
+    { "from": "fetch", "to": "normalize", "variant": "emphasis" },
+    { "from": "normalize", "to": "archive", "label": "текст + provenance", "variant": "emphasis", "labelAt": [710, 156] },
+    { "from": "archive", "to": "enrich", "variant": "emphasis" },
+    { "from": "enrich", "to": "cards", "variant": "emphasis" },
+    { "from": "cards", "to": "fts", "label": "перестроение индексов", "fromSide": "bottom", "toSide": "top", "labelAt": [1210, 238] },
+    { "from": "cards", "to": "graph", "label": "явный load: graph_text", "variant": "dashed", "fromSide": "bottom", "toSide": "top" },
+    { "from": "interface", "to": "answer", "label": "вопрос", "variant": "emphasis" },
+    { "from": "answer", "to": "graph", "label": "поиск", "fromSide": "top", "toSide": "bottom" },
+    { "from": "answer", "to": "fts", "label": "поиск карточек и сегментов", "fromSide": "top", "toSide": "bottom", "labelAt": [1100, 410] },
+    { "from": "answer", "to": "providers", "label": "синтез ответа", "fromSide": "right", "toSide": "left" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Загрузка", "items": ["run: fetch → normalize → enrich → FTS и реестр источников", "LightRAG загружается отдельной командой load"] },
+    { "dot": "emerald", "title": "Ответ", "items": ["Late Fusion собирает LightRAG, карточки и YouTube-сегменты", "Источник проверяется до финального ответа с цитатами"] }
+  ]
+}
