@@ -116,9 +116,9 @@ The configured reasoning effort is passed explicitly even though the isolated
 process ignores the user's global Codex configuration. The model identity
 stored in generated metadata includes the effort, for example
 `codex-cli:gpt-6-luna@xhigh`.
-API fallback is disabled by default (`CODEX_FALLBACK_TO_API=false`). Gemini
-transcription/Vision and Qwen embeddings remain separate OpenRouter-backed
-services. Changing model, profile or reasoning effort preserves valid cards and
+API fallback is disabled by default (`CODEX_FALLBACK_TO_API=false`). Whisper
+transcription and Qwen embeddings remain separate OpenRouter-backed services;
+visual analysis uses the Luna media backend. Changing model, profile or reasoning effort preserves valid cards and
 complete YouTube generations, including their original model provenance. Source,
 metadata, schema and processing-rule changes still invalidate affected results;
 explicit force remains available. The legacy `REGENERATE_ON_PROFILE_CHANGE`
@@ -215,7 +215,7 @@ text layer retain a diagnostic and require review. A policy skip is distinct
 from an error in selected processing. Query-time media analysis is not added.
 
 Text enrichment and final synthesis use Luna through the authenticated Codex
-CLI. Audio remains on Gemini with the configured Whisper fallback. Native image
+CLI. Audio uses only `openai/whisper-large-v3` through OpenRouter STT. Native image
 and video visual analysis uses the Luna media backend; it stores a status and a
 model/input-identity artifact in the normalized sidecar. A failed selected
 operation retains diagnostics and is never presented as successful media
@@ -474,7 +474,7 @@ a clean graph rebuild. The current Luna post-structure smoke is documented in
 ## Current media/RAG remediation status
 
 - Text enrichment: Luna (`LLM_PROFILE=luna`, `CODEX_LUNA_MODEL=gpt-6-luna`).
-- Audio transcription: Gemini/OpenRouter route; reranker remains disabled.
+- Audio transcription: `openai/whisper-large-v3` through OpenRouter STT; reranker remains disabled.
 - Late-Fusion is enabled; accepted manifest loading is fail-closed. The current corpus uses dynamic N/N accounting (131 accepted sources in the release manifest). Historical release-evidence findings, including R24 prepared-publication and SQLite-recovery hardening, remain documented. On 2026-09-10 the owner accepted those residual risks and removed their mandatory execution gate; this does not mark the findings fixed or provide the stronger R24 concurrency/recovery guarantee.
 - Use the project `.venv` for yt-dlp checks and pipeline commands.
 - Before publishing a formal release bundle, review the deferred R24 risks and record whether the run accepts them; do not treat historical `bundle_final*` directories as interchangeable release evidence.

@@ -241,115 +241,62 @@ class HandlerTests(unittest.TestCase):
         self.assertNotIn("bit.ly", result)
 
     def test_transcribe_media_writes_artifact(self):
-        response = Mock()
-        response.ok = True
-        response.json.return_value = {
-            "choices": [{"message": {"content": "transcribed native media"}}]
-        }
-
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            media_path = root / "media_cache" / "Channel" / "voice" / "msg_11.ogg"
-            media_path.parent.mkdir(parents=True)
+            media_path = root / "voice.ogg"
             media_path.write_bytes(b"fake audio")
-            transcript_dir = root / "output" / "transcripts"
-            item = TelegramMedia(
-                media_type="voice",
-                mime_type="audio/ogg",
-                message_id=11,
-                file_path=str(media_path),
-                download_status="downloaded",
-            )
-
+            item = TelegramMedia(media_type="voice", mime_type="audio/ogg", message_id=11,
+                                 file_path=str(media_path), download_status="downloaded")
+            response = Mock(ok=True, status_code=200)
+            response.json.return_value = {"text": "transcribed native media"}
             with (
-                patch(
-                    "normalizer.transcription_handler.config.MEDIA_CACHE_DIR",
-                    root / "media_cache",
-                ),
-                patch("normalizer.transcription_handler.config.TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "MEDIA_CACHE_DIR", root),
+                patch.object(config, "TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "TRANSCRIPTION_API_KEY", "api-key"),
+                patch.object(config, "TRANSCRIPTION_BASE_URL", "https://example.com/v1"),
+                patch.object(config, "TRANSCRIPTION_MODEL", "openai/whisper-large-v3"),
+                patch.object(config, "TRANSCRIPTION_DIR", root / "transcripts"),
+                patch("normalizer.transcription_handler.requests.post", return_value=response) as post,
             ):
-                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_API_KEY", "api-key"):
-                    with patch("normalizer.transcription_handler.config.TRANSCRIPTION_BASE_URL", "https://example.com/v1"):
-                        with patch("normalizer.transcription_handler.config.TRANSCRIPTION_MODEL", "whisper-1"):
-                            with patch("normalizer.transcription_handler.config.TRANSCRIPTION_LANGUAGE", ""):
-                                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_TIMEOUT_SECONDS", 10):
-                                    with patch("normalizer.transcription_handler.config.TRANSCRIPTION_DIR", transcript_dir):
-                                        with patch(
-                                            "normalizer.transcription_handler.requests.post",
-                                            return_value=response,
-                                        ) as post:
-                                            result = transcribe_media(item, "Channel", 11)
-
-            artifact_path = Path(result.artifact_path)
-            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-
+                result = transcribe_media(item, "Channel", 11)
+                payload = json.loads(Path(result.artifact_path).read_text(encoding="utf-8"))
+                cached = transcribe_media(item, "Channel", 11)
         self.assertEqual(result.status, "transcribed")
         self.assertEqual(result.text, "transcribed native media")
-        self.assertEqual(payload["text"], "transcribed native media")
+        self.assertEqual(cached.text, result.text)
+        self.assertEqual(payload["model"], "openai/whisper-large-v3")
         self.assertEqual(payload["media"]["media_type"], "voice")
-        self.assertEqual(post.call_args.kwargs["json"]["model"], "whisper-1")
-        audio = post.call_args.kwargs["json"]["messages"][0]["content"][0]
-        self.assertEqual(audio["type"], "input_audio")
-        self.assertEqual(audio["input_audio"]["format"], "ogg")
-        self.assertIn("/chat/completions", post.call_args.args[0])
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], "https://example.com/v1/audio/transcriptions")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "openai/whisper-large-v3")
+        self.assertEqual(post.call_args.kwargs["json"]["input_audio"]["format"], "ogg")
 
-    def test_transcribe_media_uses_json_stt_fallback_after_audio_route_400(self):
-        primary = Mock(ok=False, status_code=400, text='{"error":"audio unsupported"}')
-        fallback = Mock(ok=True, status_code=200)
-        fallback.json.return_value = {"text": "fallback transcript"}
-
+    def test_transcribe_media_records_stt_failure_without_model_fallback(self):
+        response = Mock(ok=False, status_code=400, text='{"error":"unsupported audio"}')
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            media_path = root / "media_cache" / "Channel" / "voice" / "msg_12.ogg"
-            media_path.parent.mkdir(parents=True)
+            media_path = root / "voice.ogg"
             media_path.write_bytes(b"fake audio")
-            transcript_dir = root / "output" / "transcripts"
-            item = TelegramMedia(
-                media_type="voice",
-                mime_type="audio/ogg",
-                message_id=12,
-                file_path=str(media_path),
-                download_status="downloaded",
-            )
-
+            item = TelegramMedia(media_type="voice", mime_type="audio/ogg", message_id=12,
+                                 file_path=str(media_path), download_status="downloaded")
             with (
-                patch(
-                    "normalizer.transcription_handler.config.MEDIA_CACHE_DIR",
-                    root / "media_cache",
-                ),
-                patch("normalizer.transcription_handler.config.TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "MEDIA_CACHE_DIR", root),
+                patch.object(config, "TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "TRANSCRIPTION_API_KEY", "api-key"),
+                patch.object(config, "TRANSCRIPTION_MODEL", "openai/whisper-large-v3"),
+                patch.object(config, "TRANSCRIPTION_DIR", root / "transcripts"),
+                patch("normalizer.transcription_handler.requests.post", return_value=response) as post,
             ):
-                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_API_KEY", "api-key"):
-                    with patch("normalizer.transcription_handler.config.TRANSCRIPTION_BASE_URL", "https://example.com/v1"):
-                        with patch("normalizer.transcription_handler.config.TRANSCRIPTION_MODEL", "gemini-audio"):
-                            with patch(
-                                "normalizer.transcription_handler.config.TRANSCRIPTION_STT_MODEL",
-                                "openai/whisper-large-v3",
-                            ):
-                                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_LANGUAGE", ""):
-                                    with patch("normalizer.transcription_handler.config.TRANSCRIPTION_TIMEOUT_SECONDS", 10):
-                                        with patch("normalizer.transcription_handler.config.TRANSCRIPTION_DIR", transcript_dir):
-                                            with patch(
-                                                "normalizer.transcription_handler.requests.post",
-                                                side_effect=[primary, fallback],
-                                            ) as post:
-                                                result = transcribe_media(item, "Channel", 12)
+                result = transcribe_media(item, "Channel", 12)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.route, "audio/transcriptions")
+        self.assertEqual(result.attempts[0]["status_code"], 400)
+        self.assertEqual(len(result.attempts), 1)
+        post.assert_called_once()
 
-        self.assertEqual(result.status, "transcribed")
-        self.assertEqual(result.text, "fallback transcript")
-        self.assertEqual(post.call_count, 2)
-        self.assertIn("/chat/completions", post.call_args_list[0].args[0])
-        self.assertIn("/audio/transcriptions", post.call_args_list[1].args[0])
-        fallback_payload = post.call_args_list[1].kwargs["json"]
-        self.assertEqual(fallback_payload["model"], "openai/whisper-large-v3")
-        self.assertIn("input_audio", fallback_payload)
-        self.assertNotIn("files", post.call_args_list[1].kwargs)
-
-    def test_transcribe_media_extracts_audio_from_video_before_chat_request(self):
+    def test_transcribe_media_extracts_audio_from_video_before_stt_request(self):
         response = Mock(ok=True)
-        response.json.return_value = {
-            "choices": [{"message": {"content": "video transcript"}}]
-        }
+        response.json.return_value = {"text": "video transcript"}
 
         def fake_ffmpeg(command, **kwargs):
             Path(command[-1]).write_bytes(b"extracted mp3")
@@ -357,47 +304,45 @@ class HandlerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            media_path = root / "media_cache" / "Channel" / "video" / "msg_13.mp4"
-            media_path.parent.mkdir(parents=True)
+            media_path = root / "video.mp4"
             media_path.write_bytes(b"fake video")
-            transcript_dir = root / "output" / "transcripts"
-            item = TelegramMedia(
-                media_type="video",
-                mime_type="video/mp4",
-                message_id=13,
-                file_path=str(media_path),
-                download_status="downloaded",
-            )
-
+            item = TelegramMedia(media_type="video", mime_type="video/mp4", message_id=13,
+                                 file_path=str(media_path), download_status="downloaded")
             with (
-                patch(
-                    "normalizer.transcription_handler.config.MEDIA_CACHE_DIR",
-                    root / "media_cache",
-                ),
-                patch("normalizer.transcription_handler.config.TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "MEDIA_CACHE_DIR", root),
+                patch.object(config, "TRANSCRIPTION_ENABLED", True),
+                patch.object(config, "TRANSCRIPTION_API_KEY", "api-key"),
+                patch.object(config, "TRANSCRIPTION_DIR", root / "transcripts"),
+                patch("normalizer.transcription_handler.subprocess.run", side_effect=fake_ffmpeg),
+                patch("normalizer.transcription_handler.requests.post", return_value=response) as post,
             ):
-                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_API_KEY", "api-key"):
-                    with patch("normalizer.transcription_handler.config.TRANSCRIPTION_BASE_URL", "https://example.com/v1"):
-                        with patch("normalizer.transcription_handler.config.TRANSCRIPTION_MODEL", "gemini-audio"):
-                            with patch("normalizer.transcription_handler.config.TRANSCRIPTION_TIMEOUT_SECONDS", 10):
-                                with patch("normalizer.transcription_handler.config.TRANSCRIPTION_DIR", transcript_dir):
-                                    with patch(
-                                        "normalizer.transcription_handler.subprocess.run",
-                                        side_effect=fake_ffmpeg,
-                                    ):
-                                        with patch(
-                                            "normalizer.transcription_handler.requests.post",
-                                            return_value=response,
-                                        ) as post:
-                                            result = transcribe_media(item, "Channel", 13)
-
+                result = transcribe_media(item, "Channel", 13)
         self.assertEqual(result.status, "transcribed")
-        audio = post.call_args.kwargs["json"]["messages"][0]["content"][0]
-        self.assertEqual(audio["input_audio"]["format"], "mp3")
-        self.assertEqual(
-            __import__("base64").b64decode(audio["input_audio"]["data"]),
-            b"extracted mp3",
-        )
+        audio = post.call_args.kwargs["json"]["input_audio"]
+        self.assertEqual(audio["format"], "mp3")
+        self.assertEqual(__import__("base64").b64decode(audio["data"]), b"extracted mp3")
+
+    def test_instagram_and_youtube_audio_use_whisper_stt(self):
+        from normalizer.instagram.audio import _transcribe_audio
+        from normalizer.youtube_handler import _call_whisper
+
+        for transcribe in (_transcribe_audio, _call_whisper):
+            with self.subTest(source=transcribe.__module__), tempfile.TemporaryDirectory() as tmpdir:
+                audio = Path(tmpdir) / "audio.mp3"
+                audio.write_bytes(b"fake audio")
+                response = Mock(ok=True)
+                response.json.return_value = {"text": "linked audio transcript"}
+                with (
+                    patch.object(config, "TRANSCRIPTION_ENABLED", True),
+                    patch.object(config, "TRANSCRIPTION_API_KEY", "api-key"),
+                    patch.object(config, "TRANSCRIPTION_MODEL", "openai/whisper-large-v3"),
+                    patch("normalizer.transcription_handler.requests.post", return_value=response) as post,
+                ):
+                    self.assertEqual(transcribe(audio), "linked audio transcript")
+                post.assert_called_once()
+                self.assertTrue(post.call_args.args[0].endswith("/audio/transcriptions"))
+                self.assertEqual(post.call_args.kwargs["json"]["model"], "openai/whisper-large-v3")
+
 
 
 # ─────────────────────── Instagram Deep Extract Tests ───────────────────────

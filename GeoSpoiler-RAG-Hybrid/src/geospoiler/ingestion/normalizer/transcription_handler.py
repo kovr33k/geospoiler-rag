@@ -41,7 +41,7 @@ class TranscriptionResult:
 
 
 class TranscriptionRequestError(RuntimeError):
-    """An HTTP/API contract error that may be eligible for the STT fallback."""
+    """A failed STT request with retained HTTP and attempt diagnostics."""
 
     def __init__(self, endpoint: str, status_code: int, detail: str, *, attempts: list[dict[str, Any]] | None = None) -> None:
         self.endpoint = endpoint
@@ -126,129 +126,30 @@ def transcribe_media(
 
 
 def _call_transcription_api(media_path: Path, media_type: str = "") -> TranscriptionResult:
-    """Call the primary chat-audio route, then the controlled STT fallback.
-
-    Every attempt is retained in the result/error so a failed media item is
-    diagnosable without reproducing the network call.
-    """
-    attempts: list[dict[str, Any]] = []
+    """Transcribe prepared audio through the single configured STT model."""
     started = time.perf_counter()
+    route = "audio/transcriptions"
     with _prepared_audio(media_path, media_type) as audio_path:
         try:
-            result = _call_chat_audio(audio_path)
-            result.route = "chat/completions"
-            result.attempts = [{"route": result.route, "status": result.status}]
-            result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-            return result
-        except TranscriptionRequestError as primary_error:
-            primary_attempt = {
-                "route": "chat/completions",
-                "status": "error",
-                "status_code": primary_error.status_code,
-                "detail": primary_error.detail,
-                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-            }
-            attempts.append(primary_attempt)
-            if primary_error.status_code not in {400, 404, 415, 422}:
-                primary_error.attempts = attempts
-                raise
-            logger.warning(
-                "Primary OpenRouter audio route failed; trying STT fallback: %s",
-                primary_error,
-            )
-            fallback_started = time.perf_counter()
-            try:
-                result = _call_stt_audio(audio_path)
-                result.route = "audio/transcriptions"
-                attempts.append({"route": result.route, "status": result.status,
-                                 "model": result.model,
-                                 "latency_ms": round((time.perf_counter() - fallback_started) * 1000, 2)})
-                result.attempts = attempts
-                result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                return result
-            except (TranscriptionRequestError, requests.RequestException) as fallback_error:
-                status_code = (
-                    fallback_error.status_code
-                    if isinstance(fallback_error, TranscriptionRequestError)
-                    else 0
-                )
-                detail = (
-                    fallback_error.detail
-                    if isinstance(fallback_error, TranscriptionRequestError)
-                    else fallback_error.__class__.__name__
-                )
-                attempts.append({"route": "audio/transcriptions", "status": "error",
-                                 "status_code": status_code,
-                                 "detail": detail,
-                                 "latency_ms": round((time.perf_counter() - fallback_started) * 1000, 2)})
-                raise TranscriptionRequestError(
-                    "chat/completions + audio/transcriptions",
-                    status_code,
-                    f"primary={primary_error.detail}; fallback={detail}",
-                    attempts=attempts,
-                ) from fallback_error
-
-def _call_chat_audio(audio_path: Path) -> TranscriptionResult:
-    endpoint = f"{config.TRANSCRIPTION_BASE_URL.rstrip('/')}/chat/completions"
-    payload = {
-        "model": config.TRANSCRIPTION_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": _audio_base64(audio_path),
-                            "format": _audio_format(audio_path),
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Транскрибируй это аудио дословно на русском языке. "
-                            "Верни только текст транскрипции, без комментариев. "
-                            "Если в аудио только музыка без речи, верни: [только музыка]"
-                        ),
-                    },
-                ],
-            }
-        ],
-        "max_tokens": 16000,
-    }
-    response = requests.post(
-        endpoint,
-        headers=_json_headers(),
-        json=payload,
-        timeout=config.TRANSCRIPTION_TIMEOUT_SECONDS,
-    )
-    _check_response(response, endpoint)
-    response_payload = response.json()
-    content = response_payload.get("choices", [{}])[0].get("message", {}).get("content")
-    text = _message_text(content)
-    if text.lower() in {"[только музыка]", "[only music]"}:
-        return TranscriptionResult(
-            status="no_speech",
-            error="music_only",
-            model=config.TRANSCRIPTION_MODEL,
-        )
-    if not text:
-        return TranscriptionResult(
-            status="failed",
-            error="empty_transcript",
-            model=config.TRANSCRIPTION_MODEL,
-        )
-    return TranscriptionResult(
-        status="transcribed",
-        text=text,
-        model=config.TRANSCRIPTION_MODEL,
-    )
+            result = _call_stt_audio(audio_path)
+        except (TranscriptionRequestError, requests.RequestException) as exc:
+            status_code = exc.status_code if isinstance(exc, TranscriptionRequestError) else 0
+            detail = exc.detail if isinstance(exc, TranscriptionRequestError) else type(exc).__name__
+            attempts = [{"route": route, "status": "error", "status_code": status_code,
+                         "detail": detail, "model": config.TRANSCRIPTION_MODEL,
+                         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}]
+            raise TranscriptionRequestError(route, status_code, detail, attempts=attempts) from exc
+    result.route = route
+    result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    result.attempts = [{"route": route, "status": result.status, "model": result.model,
+                        "latency_ms": result.latency_ms}]
+    return result
 
 
 def _call_stt_audio(audio_path: Path) -> TranscriptionResult:
     endpoint = f"{config.TRANSCRIPTION_BASE_URL.rstrip('/')}/audio/transcriptions"
     payload: dict[str, Any] = {
-        "model": config.TRANSCRIPTION_STT_MODEL,
+        "model": config.TRANSCRIPTION_MODEL,
         "input_audio": {
             "data": _audio_base64(audio_path),
             "format": _audio_format(audio_path),
@@ -270,12 +171,12 @@ def _call_stt_audio(audio_path: Path) -> TranscriptionResult:
         return TranscriptionResult(
             status="failed",
             error="empty_transcript",
-            model=config.TRANSCRIPTION_STT_MODEL,
+            model=config.TRANSCRIPTION_MODEL,
         )
     return TranscriptionResult(
         status="transcribed",
         text=text,
-        model=config.TRANSCRIPTION_STT_MODEL,
+        model=config.TRANSCRIPTION_MODEL,
     )
 
 
@@ -295,16 +196,6 @@ def _check_response(response: requests.Response, endpoint: str) -> None:
     detail = (response.text or "").strip().replace("\n", " ")[:500] or "no response body"
     logger.warning("OpenRouter transcription HTTP %s at %s: %s", response.status_code, endpoint, detail)
     raise TranscriptionRequestError(endpoint, response.status_code, detail)
-
-
-def _message_text(content: Any) -> str:
-    if isinstance(content, list):
-        return " ".join(
-            str(part.get("text") or "").strip()
-            for part in content
-            if isinstance(part, dict) and part.get("text")
-        ).strip()
-    return str(content or "").strip()
 
 
 def _audio_base64(audio_path: Path) -> str:
@@ -387,8 +278,7 @@ def _read_cached_artifact(path: Path, input_sha256: str) -> TranscriptionResult 
     if payload.get("input_sha256") != input_sha256:
         return None
     model = str(payload.get("model") or "")
-    expected_models = {config.TRANSCRIPTION_MODEL, config.TRANSCRIPTION_STT_MODEL}
-    if model not in expected_models:
+    if model != config.TRANSCRIPTION_MODEL:
         return None
     text = str(payload.get("text") or "").strip()
     if status == "transcribed" and (not text or _is_degenerate_transcript(text)):

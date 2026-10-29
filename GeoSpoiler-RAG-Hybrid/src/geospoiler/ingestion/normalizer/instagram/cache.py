@@ -24,7 +24,6 @@ def _cache_signature() -> dict:
         "transcription_enabled": config.TRANSCRIPTION_ENABLED,
         "transcription_base_url": config.TRANSCRIPTION_BASE_URL,
         "transcription_model": config.TRANSCRIPTION_MODEL,
-        "transcription_stt_model": config.TRANSCRIPTION_STT_MODEL,
         "transcription_language": config.TRANSCRIPTION_LANGUAGE,
         "vision_base_url": config.INSTAGRAM_VISION_BASE_URL,
         "vision_api_base_url": config.VISION_BASE_URL,

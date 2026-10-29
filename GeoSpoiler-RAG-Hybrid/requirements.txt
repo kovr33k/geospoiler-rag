@@ -1,8 +1,8 @@
 # Telegram
-telethon>=1.36.0
+telethon>=1.45.0
 
 # LightRAG
-lightrag-hku==1.5.4
+lightrag-hku==1.5.7
 openai>=2.0.0
 
 # Web scraping
@@ -10,7 +10,7 @@ crawl4ai>=0.4.0
 requests>=2.31.0
 
 # YouTube/Instagram media extraction (Instagram API-compatible extractor)
-yt-dlp>=2026.7.4
+yt-dlp>=2026.10.26
 
 # Environment
 python-dotenv>=1.0.0

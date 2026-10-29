@@ -104,7 +104,7 @@ class RemediationHardeningTests(unittest.TestCase):
         try:
             config.TRANSCRIPTION_ENABLED = True
             config.TRANSCRIPTION_API_KEY = ""
-            with patch("normalizer.instagram.audio._call_chat_audio") as primary:
+            with patch("normalizer.instagram.audio._call_transcription_api") as primary:
                 self.assertIsNone(audio._transcribe_audio(Path("missing.mp3")))
             primary.assert_not_called()
         finally:

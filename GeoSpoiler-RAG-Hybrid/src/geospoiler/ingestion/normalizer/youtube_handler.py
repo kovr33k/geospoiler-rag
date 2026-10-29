@@ -13,16 +13,15 @@ import json
 import logging
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
-import requests
-
 from geospoiler import config
-from geospoiler.providers.llm_auth import get_openai_api_key
+from geospoiler.ingestion.normalizer.transcription_handler import _call_transcription_api
 
 logger = logging.getLogger("geospoiler.normalizer.youtube")
 
@@ -311,7 +310,7 @@ def _get_video_info(url: str) -> dict | None:
     try:
         result = subprocess.run(
             [
-                "yt-dlp",
+                sys.executable, "-m", "yt_dlp",
                 "--dump-json",
                 "--no-download",
                 "--no-warnings",
@@ -349,7 +348,7 @@ def _get_timed_subtitles(url: str, info: dict) -> tuple[list[YouTubeCue], str, s
     with tempfile.TemporaryDirectory(prefix=f"{_safe_component(video_id)}-", dir=sub_root) as temp_dir:
         out_template = str(Path(temp_dir) / "%(id)s")
         cmd = [
-            "yt-dlp",
+            sys.executable, "-m", "yt_dlp",
             "--skip-download",
             "--no-warnings",
             "--write-auto-subs" if use_auto else "--write-subs",
@@ -546,7 +545,7 @@ def _transcribe_audio(url: str, info: dict) -> str | None:
         # Step 1: download audio into an invocation-specific directory.
         try:
             result = subprocess.run(
-                ["yt-dlp", "-x", "--no-warnings", "-o", str(raw_path), url],
+                [sys.executable, "-m", "yt_dlp", "-x", "--no-warnings", "-o", str(raw_path), url],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -608,41 +607,12 @@ def _split_audio(input_path: Path, out_dir: Path, prefix: str) -> list[Path]:
 
 
 def _call_whisper(audio_path: Path) -> str | None:
-    """Transcribe audio via configured API (supports chat-completions and STT endpoints)."""
-    import base64
-
-    api_key = get_openai_api_key(config.TRANSCRIPTION_API_KEY, config.TRANSCRIPTION_BASE_URL)
-    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
-    base_url = config.TRANSCRIPTION_BASE_URL.rstrip("/")
-
-    # Use chat completions for LLM-based transcription (Gemini, etc.)
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    """Transcribe a YouTube audio chunk through the shared STT route."""
     try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers=headers,
-            json={
-                "model": config.TRANSCRIPTION_MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "mp3"}},
-                        {"type": "text", "text": "Транскрибируй это аудио дословно на русском языке. Верни только текст транскрипции, без комментариев."},
-                    ],
-                }],
-                "max_tokens": 16000,
-            },
-            timeout=config.TRANSCRIPTION_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        text = str(payload["choices"][0]["message"].get("content") or "").strip()
-        return text if text else None
-    except requests.Timeout:
-        logger.warning(f"Transcription API timeout for {audio_path}")
-        return None
+        result = _call_transcription_api(audio_path)
+        return result.text.strip() if result.status == "transcribed" else None
     except Exception as exc:
-        logger.warning(f"Transcription failed for {audio_path}: {exc}")
+        logger.warning("Transcription failed for %s: %s", audio_path, exc)
         return None
 
 

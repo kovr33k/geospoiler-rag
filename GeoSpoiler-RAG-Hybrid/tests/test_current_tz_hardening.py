@@ -178,24 +178,20 @@ class CurrentTzHardeningTests(unittest.TestCase):
             self.assertEqual(meta_path.read_bytes(), original_meta)
             self.assertFalse(journal.exists())
 
-    def test_primary_400_then_fallback_timeout_preserves_both_attempts(self):
+    def test_stt_timeout_preserves_attempt_diagnostics(self):
         media = Path("audio.mp3")
-        primary = TranscriptionRequestError("chat/completions", 400, "bad multipart")
         with patch(
             "normalizer.transcription_handler._prepared_audio",
             return_value=nullcontext(media),
-        ), patch(
-            "normalizer.transcription_handler._call_chat_audio",
-            side_effect=primary,
         ), patch(
             "normalizer.transcription_handler._call_stt_audio",
             side_effect=requests.Timeout("timeout"),
         ):
             with self.assertRaises(TranscriptionRequestError) as caught:
                 _call_transcription_api(media)
-        self.assertEqual(len(caught.exception.attempts), 2)
-        self.assertEqual(caught.exception.attempts[0]["status_code"], 400)
-        self.assertEqual(caught.exception.attempts[1]["detail"], "Timeout")
+        self.assertEqual(len(caught.exception.attempts), 1)
+        self.assertEqual(caught.exception.attempts[0]["route"], "audio/transcriptions")
+        self.assertEqual(caught.exception.attempts[0]["detail"], "Timeout")
 
     def test_degenerate_transcript_is_rejected(self):
         repeated = " ".join(["и как бы снова одно и то же"] * 500)
