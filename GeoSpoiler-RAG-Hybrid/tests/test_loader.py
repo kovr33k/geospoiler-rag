@@ -229,12 +229,15 @@ class LoadTextsTests(unittest.IsolatedAsyncioTestCase):
         path = str((Path(__file__).resolve().parents[1] / "output" / "normalized" / "topic" / "1.txt").resolve())
         rag = _FakeRag()
 
-        inserted = await load_texts(rag, [(path, "hello world")], batch_size=5)
+        # Legacy layout: a local data/.layout-v2.json must not remap this path.
+        with patch("geospoiler.config.DATA_LAYOUT_VERSION", 1):
+            inserted = await load_texts(rag, [(path, "hello world")], batch_size=5)
+            expected_id = _source_doc_id(path)
 
         self.assertEqual(inserted, 1)
         self.assertEqual(rag.deleted, [])
         self.assertEqual(len(rag.inserted), 1)
-        self.assertEqual(rag.inserted[0]["ids"], [_source_doc_id(path)])
+        self.assertEqual(rag.inserted[0]["ids"], [expected_id])
         self.assertEqual(rag.inserted[0]["file_paths"], [path])
         self.assertEqual(rag.inserted[0]["texts"], ["hello world"])
 
