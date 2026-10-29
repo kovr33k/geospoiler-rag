@@ -200,6 +200,10 @@ command.
 choose operations before Telegram downloads, including photos and image documents.
 Self-contained text and vague/media-only posts retain attachment identity and an
 explicit `not_analyzed` status without downloading or analyzing the attachment.
+Exception: an image-only post (only images, and no letters or digits left in the
+caption after removing links, hashtags and emoji) always downloads and analyzes
+every image, including whole albums. Video, voice, audio and documents keep the
+selective rule.
 Explicit dependencies select image analysis, video frames, speech transcription,
 or local text/PDF extraction as needed. `all` is an explicit operator override.
 No per-post classifier model is added.

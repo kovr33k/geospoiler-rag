@@ -77,6 +77,18 @@ Check current state:
 python main.py status
 ```
 
+See which posts did not become an Enriched v2 card and why. The command only
+reads; each post gets one label: `review` (ожидает ревью), `retry` (ожидает
+повтора), `failed` (ошибка обработки) or `policy` (пропуск по политике). Open
+normalization and channel fetch failures come from
+`data/state/ingestion_outcomes.json`; `run` ends with a one-line problem count.
+
+```powershell
+python main.py ingest-report
+python main.py ingest-report --channel "Channel title" --category failed
+python main.py ingest-report --json
+```
+
 Fetch and normalize new Telegram messages without loading LightRAG:
 
 ```powershell
