@@ -86,16 +86,9 @@ def record_open_outcome(
     outcomes = state["outcomes"]
     key = _outcome_key(channel_id, message_id)
     now = datetime.now(UTC).isoformat()
-    existing = outcomes.get(key)
-    if isinstance(existing, dict):
-        try:
-            attempts = int(existing.get("attempts", 0)) + 1
-        except (TypeError, ValueError):
-            attempts = 1
-        first_seen = existing.get("first_seen") or now
-    else:
-        attempts = 1
-        first_seen = now
+    existing = outcomes.get(key) or {}
+    attempts = existing.get("attempts", 0) + 1
+    first_seen = existing.get("first_seen") or now
     outcomes[key] = {
         "channel_id": channel_id,
         "channel_title": channel_title,

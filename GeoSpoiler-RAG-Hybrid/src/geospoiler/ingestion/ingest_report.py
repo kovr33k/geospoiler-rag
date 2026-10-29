@@ -2,8 +2,7 @@
 
 Collectors are independent. Each returns problem items. ``combine_problem_items``
 merges them per (channel_id, message_id) and keeps one label, by priority
-review → retry → failed → policy. Later stages add a collector and register it
-in ``COLLECTORS``.
+review → retry → failed → policy. Collectors are listed in ``COLLECTORS``.
 """
 
 import copy
@@ -30,32 +29,185 @@ CATEGORY_LABELS = {
     "policy": "пропуск по политике",
 }
 _CATEGORY_PRIORITY = {name: index for index, name in enumerate(CATEGORIES)}
+_JOURNAL_FIELDS = (
+    "channel_id", "channel_title", "message_id", "post_url", "stage", "reason", "attempts", "first_seen", "last_seen",
+)
+# Every item carries the full JSON shape; collectors fill only what they know.
+_ITEM_DEFAULTS = dict.fromkeys(_JOURNAL_FIELDS + ("category",))
+
+# Video, voice, audio and documents without a meaningful caption are policy
+# skips. Images are not: a post «только изображение» is selected for analysis.
+_POLICY_MEDIA_TYPES = {"video", "voice", "audio", "document"}
+_UNSELECTED_REASON = "вложение не анализировалось по выборочной политике"
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def collect_journal_problems() -> list[dict]:
-    """Open normalization failures. Other stages register their own collectors."""
+    """Open normalization and fetch failures; the next run retries both."""
+    return [
+        {**{name: record.get(name) for name in _JOURNAL_FIELDS}, "category": "retry"}
+        for record in read_open_outcomes()
+        if record.get("stage") in {"normalize", "fetch"} and record.get("outcome") == "failed"
+    ]
+
+
+def _caption_from_normalized_text(text: str) -> str:
+    """User text, without the header and generated sections.
+
+    Generated sections (header, placeholders, analysis blocks) are paragraphs
+    that start with '['. Meaningful captions use caption_has_letters_or_digits.
+    """
+    kept = [paragraph for paragraph in text.split("\n\n") if not paragraph.lstrip().startswith("[")]
+    return "\n\n".join(kept)
+
+
+def _failure_detail(item: dict) -> str:
+    """Download error, otherwise visual, extraction or transcription error."""
+    first = ["error"] if item.get("download_status") == "failed" else []
+    for name in first + ["visual_error", "text_extraction_error", "transcription_error", "error"]:
+        if item.get(name):
+            return str(item[name])
+    return "ошибка обработки"
+
+
+def _classify_attachment(item: dict, *, meaningful_caption: bool) -> tuple[str, str, str] | None:
+    """Return category, media type and detail. A policy skip is never a failure."""
+    media_type = item.get("media_type") or "attachment"
+    download_status = item.get("download_status")
+    error = item.get("error") or ""
+    operations = item.get("analysis_operations")
+    if download_status == "disabled":
+        return "policy", media_type, error or "MEDIA_CAPTURE_ENABLED=false"
+    if download_status == "skipped" and error.startswith("file_size_exceeds_limit"):
+        return "policy", media_type, error
+    failed = any(item.get(name) == "failed" for name in ("download_status", "analysis_status", "text_extraction_status"))
+    if operations and failed:
+        return "failed", media_type, _failure_detail(item)
+    unselected = operations == [] or item.get("analysis_status") == "not_analyzed"
+    if unselected and media_type in _POLICY_MEDIA_TYPES and not meaningful_caption:
+        return "policy", media_type, _UNSELECTED_REASON
+    return None
+
+
+def _media_reason(problems: list[tuple[str, str]]) -> str:
+    """Types and, when a post has several problem attachments, their count."""
+    types: list[str] = []
+    details: list[str] = []
+    for media_type, detail in problems:
+        if media_type not in types:
+            types.append(media_type)
+        if detail and detail not in details:
+            details.append(detail)
+    type_part = ", ".join(types)
+    if len(problems) > 1:
+        type_part = f"{type_part} ({len(problems)})"
+    if not details:
+        return type_part
+    return f"{type_part}: {'; '.join(details)}"
+
+
+def _media_problem_item(text_path: Path) -> dict | None:
+    metadata = _read_json_object(text_path.with_suffix(".meta.json"))
+    media = metadata.get("media")
+    if not media:
+        return None
+    try:
+        saved_text = text_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        logger.warning("Skipping unreadable normalized text: %s", text_path)
+        return None
+    meaningful = caption_has_letters_or_digits(_caption_from_normalized_text(saved_text))
+    problems = [
+        classified
+        for attachment in media
+        if (classified := _classify_attachment(attachment, meaningful_caption=meaningful)) is not None
+    ]
+    if not problems:
+        return None
+    category = "failed" if any(item[0] == "failed" for item in problems) else "policy"
+    chosen = [(media_type, detail) for item_category, media_type, detail in problems if item_category == category]
+    return {
+        "channel_id": metadata.get("channel_id"),
+        "channel_title": metadata.get("channel_name"),
+        "message_id": metadata.get("message_id"),
+        "post_url": metadata.get("post_url"),
+        "stage": "media",
+        "category": category,
+        "reason": _media_reason(chosen),
+    }
+
+
+def collect_media_problems() -> list[dict]:
+    """Attachment problems from normalized metadata. One item per post, stage media."""
+    root = config.NORMALIZED_DIR
+    if not root.is_dir():
+        return []
+    items = (_media_problem_item(text_path) for text_path in sorted(root.rglob("*.txt")))
+    return [item for item in items if item is not None]
+
+
+def collect_enrichment_problems() -> list[dict]:
+    """Posts whose normalized material has no up-to-date Enriched v2 card."""
+    if not config.NORMALIZED_DIR.is_dir():
+        return []
+    jobs = enricher_pipeline._collect_enrichment_jobs(
+        progress=copy.deepcopy(enricher_pipeline._load_progress()),
+        channel_filter=None,
+        force=False,
+        stats=enricher_pipeline.EnrichmentStats(),
+        read_only=True,
+    )
     items = []
-    for record in read_open_outcomes():
-        if record.get("stage") != "normalize" or record.get("outcome") != "failed":
-            continue
-        items.append(
-            {
-                "channel_id": record.get("channel_id"),
-                "channel_title": record.get("channel_title"),
-                "message_id": record.get("message_id"),
-                "post_url": record.get("post_url"),
-                "stage": record.get("stage"),
-                "category": "retry",
-                "reason": record.get("reason"),
-                "attempts": record.get("attempts"),
-                "first_seen": record.get("first_seen"),
-                "last_seen": record.get("last_seen"),
-            }
-        )
+    for job in jobs:
+        meta = _read_json_object(job.meta_path)
+        items.append({
+            "channel_id": meta.get("channel_id"),
+            "channel_title": meta.get("channel_name") or job.channel_name,
+            "message_id": int(job.msg_id),
+            "post_url": meta.get("post_url"),
+            "stage": "enrich",
+            "category": "retry",
+            "reason": "нет актуальной карточки",
+        })
     return items
 
 
-COLLECTORS = [collect_journal_problems]
+def _review_reason(item: dict) -> str | None:
+    review_type = str(item.get("review_type") or "").strip()
+    detail = str(item.get("reason") or "").strip() or str(item.get("url") or "").strip()
+    if review_type and detail:
+        return f"{review_type}: {detail}"
+    return review_type or detail or None
+
+
+def collect_review_queue_problems() -> list[dict]:
+    """Pending review items. Enrichment failures stay retry through enricher selection."""
+    items = []
+    for review in get_pending_reviews():
+        if review.get("review_type") == REVIEW_TYPE_ENRICHMENT_FAILURE:
+            continue
+        channel, message_id = review.get("channel"), review.get("message_id")
+        # Review files store the channel name; its metadata holds the id and real title.
+        meta = {}
+        if channel and message_id is not None:
+            meta = _read_json_object(config.NORMALIZED_DIR / _sanitize(channel) / f"{message_id}.meta.json")
+        items.append({
+            "channel_id": meta.get("channel_id"),
+            "channel_title": meta.get("channel_name") or channel,
+            "message_id": message_id,
+            "post_url": meta.get("post_url"),
+            "stage": "review",
+            "category": "review",
+            "reason": _review_reason(review),
+        })
+    return items
 
 
 def combine_problem_items(items: list[dict]) -> list[dict]:
@@ -69,39 +221,15 @@ def combine_problem_items(items: list[dict]) -> list[dict]:
     return list(chosen.values())
 
 
-def _as_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
-
-
 def _with_cursor_flags(items: list[dict]) -> list[dict]:
     """A post blocks the channel cursor when its message id is still ahead of it."""
     cursors: dict[int, int] = {}
-    flagged = []
     for item in items:
-        copied = dict(item)
-        channel_id = _as_int(copied.get("channel_id"))
-        message_id = _as_int(copied.get("message_id"))
-        blocks = False
-        if channel_id is not None and message_id is not None:
-            if channel_id not in cursors:
-                cursors[channel_id] = get_last_message_id(channel_id)
-            blocks = message_id > cursors[channel_id]
-        copied["blocks_cursor"] = blocks
-        flagged.append(copied)
-    return flagged
-
-
-def _sort_key(item: dict) -> tuple:
-    message_id = item.get("message_id")
-    missing_message = message_id is None
-    return (
-        str(item.get("channel_title") or ""),
-        _as_int(item.get("channel_id")) if _as_int(item.get("channel_id")) is not None else 0,
-        missing_message,
-        message_id if isinstance(message_id, int) and not isinstance(message_id, bool) else 0,
-    )
+        channel_id, message_id = item["channel_id"], item["message_id"]
+        if channel_id is not None and channel_id not in cursors:
+            cursors[channel_id] = get_last_message_id(channel_id)
+        item["blocks_cursor"] = channel_id is not None and message_id is not None and message_id > cursors[channel_id]
+    return items
 
 
 def _summary(items: list[dict]) -> dict:
@@ -115,15 +243,15 @@ def _summary(items: list[dict]) -> dict:
 
 def build_ingest_report(*, channel: str | None = None, category: str | None = None) -> dict:
     """Build the report from registered collectors. This function only reads."""
-    collected = []
-    for collect in COLLECTORS:
-        collected.extend(collect())
+    collected = [{**_ITEM_DEFAULTS, **item} for collect in COLLECTORS for item in collect()]
     items = _with_cursor_flags(combine_problem_items(collected))
     if channel is not None:
-        items = [item for item in items if item.get("channel_title") == channel]
+        items = [item for item in items if item["channel_title"] == channel]
     if category is not None:
-        items = [item for item in items if item.get("category") == category]
-    items.sort(key=_sort_key)
+        items = [item for item in items if item["category"] == category]
+    items.sort(key=lambda item: (
+        item["channel_title"] or "", item["channel_id"] or 0, item["message_id"] is None, item["message_id"] or 0,
+    ))
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "summary": _summary(items),
@@ -189,303 +317,4 @@ def print_problem_posts_line() -> None:
         logger.exception("Could not build ingest report")
 
 
-def collect_fetch_problems() -> list[dict]:
-    """Open fetch failures from the journal, shown as awaiting retry."""
-    items = []
-    for record in read_open_outcomes():
-        if record.get("stage") != "fetch" or record.get("outcome") != "failed":
-            continue
-        items.append(
-            {
-                "channel_id": record.get("channel_id"),
-                "channel_title": record.get("channel_title"),
-                "message_id": record.get("message_id"),
-                "post_url": record.get("post_url"),
-                "stage": record.get("stage"),
-                "category": "retry",
-                "reason": record.get("reason"),
-                "attempts": record.get("attempts"),
-                "first_seen": record.get("first_seen"),
-                "last_seen": record.get("last_seen"),
-            }
-        )
-    return items
-
-
-COLLECTORS.append(collect_fetch_problems)
-
-
-# Video, voice, audio and documents without a meaningful caption are policy
-# skips. Images are not: a post «только изображение» is selected for analysis.
-_POLICY_MEDIA_TYPES = {"video", "voice", "audio", "document"}
-_UNSELECTED_REASON = "вложение не анализировалось по выборочной политике"
-
-
-def _caption_from_normalized_text(text: str) -> str:
-    """User text, without the header and generated sections.
-
-    Generated sections (header, placeholders, analysis blocks) are paragraphs
-    that start with '['. Meaningful captions use caption_has_letters_or_digits.
-    """
-    kept = [paragraph for paragraph in text.split("\n\n") if not paragraph.lstrip().startswith("[")]
-    return "\n\n".join(kept)
-
-
-def _failure_detail(item: dict) -> str:
-    """Download error, otherwise visual, extraction or transcription error."""
-    error = str(item.get("error") or "")
-    if str(item.get("download_status") or "") == "failed" and error:
-        return error
-    for detail in (
-        item.get("visual_error"),
-        item.get("text_extraction_error"),
-        item.get("transcription_error"),
-        error,
-    ):
-        if detail:
-            return str(detail)
-    return "ошибка обработки"
-
-
-def _is_processing_failure(item: dict) -> bool:
-    return (
-        str(item.get("download_status") or "") == "failed"
-        or str(item.get("analysis_status") or "") == "failed"
-        or str(item.get("text_extraction_status") or "") == "failed"
-    )
-
-
-def _classify_attachment(item: dict, *, meaningful_caption: bool) -> tuple[str, str, str] | None:
-    """Return category, media type and detail. A policy skip is never a failure."""
-    if not isinstance(item, dict):
-        return None
-    media_type = str(item.get("media_type") or "attachment")
-    download_status = str(item.get("download_status") or "")
-    error = str(item.get("error") or "")
-    operations = item.get("analysis_operations")
-    selected = isinstance(operations, list) and bool(operations)
-    if download_status == "disabled":
-        return "policy", media_type, error or "MEDIA_CAPTURE_ENABLED=false"
-    if download_status == "skipped" and error.startswith("file_size_exceeds_limit"):
-        return "policy", media_type, error
-    if selected and _is_processing_failure(item):
-        return "failed", media_type, _failure_detail(item)
-    unselected = operations == [] or item.get("analysis_status") == "not_analyzed"
-    if unselected and media_type in _POLICY_MEDIA_TYPES and not meaningful_caption:
-        return "policy", media_type, _UNSELECTED_REASON
-    return None
-
-
-def _media_reason(problems: list[tuple[str, str]]) -> str:
-    """Types and, when a post has several problem attachments, their count."""
-    types: list[str] = []
-    details: list[str] = []
-    for media_type, detail in problems:
-        if media_type not in types:
-            types.append(media_type)
-        if detail and detail not in details:
-            details.append(detail)
-    type_part = ", ".join(types)
-    if len(problems) > 1:
-        type_part = f"{type_part} ({len(problems)})"
-    if not details:
-        return type_part
-    return f"{type_part}: {'; '.join(details)}"
-
-
-def _media_problem_item(text_path: Path) -> dict | None:
-    meta_path = text_path.with_suffix(".meta.json")
-    if not meta_path.is_file():
-        return None
-    try:
-        saved_text = text_path.read_text(encoding="utf-8")
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        logger.warning("Skipping unreadable normalized metadata: %s", text_path)
-        return None
-    if not isinstance(metadata, dict):
-        return None
-    media = metadata.get("media")
-    if not isinstance(media, list) or not media:
-        return None
-    meaningful = caption_has_letters_or_digits(_caption_from_normalized_text(saved_text))
-    problems = []
-    for attachment in media:
-        classified = _classify_attachment(attachment, meaningful_caption=meaningful)
-        if classified is not None:
-            problems.append(classified)
-    if not problems:
-        return None
-    category = "failed" if any(item[0] == "failed" for item in problems) else "policy"
-    chosen = [(media_type, detail) for item_category, media_type, detail in problems if item_category == category]
-    return {
-        "channel_id": metadata.get("channel_id"),
-        "channel_title": metadata.get("channel_name"),
-        "message_id": metadata.get("message_id"),
-        "post_url": metadata.get("post_url"),
-        "stage": "media",
-        "category": category,
-        "reason": _media_reason(chosen),
-        "attempts": None,
-        "first_seen": None,
-        "last_seen": None,
-    }
-
-
-def collect_media_problems() -> list[dict]:
-    """Attachment problems from normalized metadata. One item per post, stage media."""
-    root = config.NORMALIZED_DIR
-    if not root.is_dir():
-        return []
-    items = []
-    for text_path in sorted(root.rglob("*.txt")):
-        item = _media_problem_item(text_path)
-        if item is not None:
-            items.append(item)
-    return items
-
-
-COLLECTORS.append(collect_media_problems)
-
-
-def _read_json_object(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def _coerce_id(value: object) -> int | str | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        if text.lstrip("-").isdigit():
-            return int(text)
-        return text
-    return None
-
-
-def _text_or_none(value: object) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _meta_for_review(item: dict) -> dict:
-    """Normalized metadata for a review item. Review files store the channel name, not its id."""
-    candidates: list[Path] = []
-    raw_path = item.get("normalized_filepath")
-    if isinstance(raw_path, str) and raw_path.strip():
-        text_path = Path(raw_path)
-        if text_path.name.endswith(".meta.json"):
-            candidates.append(text_path)
-        else:
-            candidates.append(text_path.with_suffix(".meta.json"))
-    channel = item.get("channel")
-    message_id = item.get("message_id")
-    if isinstance(channel, str) and channel.strip() and message_id is not None:
-        filename = f"{message_id}.meta.json"
-        directory = _sanitize(channel)
-        candidates.append(config.NORMALIZED_DIR / directory / filename)
-        if directory != channel:
-            candidates.append(config.NORMALIZED_DIR / channel / filename)
-    for path in candidates:
-        meta = _read_json_object(path)
-        if meta:
-            return meta
-    return {}
-
-
-def _review_reason(item: dict) -> str | None:
-    review_type = str(item.get("review_type") or "").strip()
-    detail = str(item.get("reason") or "").strip() or str(item.get("url") or "").strip()
-    if review_type and detail:
-        return f"{review_type}: {detail}"
-    return review_type or detail or None
-
-
-def _problem_item(
-    *,
-    channel_id: int | str | None,
-    channel_title: str | None,
-    message_id: int | str | None,
-    post_url: str | None,
-    stage: str,
-    category: str,
-    reason: str | None,
-) -> dict:
-    return {
-        "channel_id": channel_id,
-        "channel_title": channel_title,
-        "message_id": message_id,
-        "post_url": post_url,
-        "stage": stage,
-        "category": category,
-        "reason": reason,
-        "attempts": None,
-        "first_seen": None,
-        "last_seen": None,
-    }
-
-
-def collect_enrichment_problems() -> list[dict]:
-    """Posts whose normalized material has no up-to-date Enriched v2 card."""
-    if not config.NORMALIZED_DIR.is_dir():
-        return []
-    progress = copy.deepcopy(enricher_pipeline._load_progress())
-    stats = enricher_pipeline.EnrichmentStats()
-    jobs = enricher_pipeline._collect_enrichment_jobs(
-        progress=progress,
-        channel_filter=None,
-        force=False,
-        stats=stats,
-        read_only=True,
-    )
-    items = []
-    for job in jobs:
-        meta = _read_json_object(job.meta_path)
-        items.append(
-            _problem_item(
-                channel_id=_coerce_id(meta.get("channel_id")),
-                channel_title=_text_or_none(meta.get("channel_name")) or job.channel_name,
-                message_id=_coerce_id(job.msg_id),
-                post_url=_text_or_none(meta.get("post_url")),
-                stage="enrich",
-                category="retry",
-                reason="нет актуальной карточки",
-            )
-        )
-    return items
-
-
-def collect_review_queue_problems() -> list[dict]:
-    """Pending review items. Enrichment failures stay retry through enricher selection."""
-    items = []
-    for review in get_pending_reviews():
-        if review.get("review_type") == REVIEW_TYPE_ENRICHMENT_FAILURE:
-            continue
-        meta = _meta_for_review(review)
-        items.append(
-            _problem_item(
-                channel_id=_coerce_id(meta.get("channel_id")),
-                channel_title=_text_or_none(meta.get("channel_name")) or _text_or_none(review.get("channel")),
-                message_id=_coerce_id(review.get("message_id")),
-                post_url=_text_or_none(meta.get("post_url")),
-                stage="review",
-                category="review",
-                reason=_review_reason(review),
-            )
-        )
-    return items
-
-
-COLLECTORS.append(collect_enrichment_problems)
-COLLECTORS.append(collect_review_queue_problems)
+COLLECTORS = [collect_journal_problems, collect_media_problems, collect_enrichment_problems, collect_review_queue_problems]

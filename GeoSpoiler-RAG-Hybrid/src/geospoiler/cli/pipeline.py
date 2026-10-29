@@ -483,10 +483,8 @@ def _sync_normalization_outcomes(
 
     The channel cursor is updated by the caller and is left unchanged here.
     """
-    failed_ids = set()
     for failure in result.failures:
         msg = failure.message
-        failed_ids.add((msg.channel_id, msg.message_id))
         record_open_outcome(
             channel_id=msg.channel_id,
             channel_title=msg.channel_name,
@@ -499,7 +497,7 @@ def _sync_normalization_outcomes(
         )
     successful_ids = {int(Path(path).stem) for path, _ in result.texts_with_paths}
     for msg in messages:
-        if msg.message_id in successful_ids and (msg.channel_id, msg.message_id) not in failed_ids:
+        if msg.message_id in successful_ids:
             close_outcome(msg.channel_id, msg.message_id)
 
 

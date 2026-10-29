@@ -13,16 +13,6 @@ _KEYCAP_RE = re.compile(r"[0-9#*]\ufe0f?\u20e3")
 _HASHTAG_RE = re.compile(r"#\w+")
 # Same http(s) and scheme-less www tokens as normalization.
 _URL_TOKEN_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F000-\U0001FAFF"
-    "\u2600-\u27BF"
-    "\u200d"
-    "\ufe0e\ufe0f"
-    "\U000E0020-\U000E007F"
-    "]+"
-)
-_LETTERLIKE_EMOJI_RE = re.compile(r"[\u2100-\u214F]\ufe0f?")
 
 
 def media_operations(
@@ -87,13 +77,11 @@ def caption_has_letters_or_digits(text: str) -> bool:
     cleaned = strip_url_tokens(text)
     cleaned = _KEYCAP_RE.sub(" ", cleaned)
     cleaned = _HASHTAG_RE.sub(" ", cleaned)
-    cleaned = _EMOJI_RE.sub(" ", cleaned)
-    cleaned = _LETTERLIKE_EMOJI_RE.sub(" ", cleaned)
     return any(_is_meaningful_char(ch) for ch in cleaned)
 
 
 def _is_meaningful_char(ch: str) -> bool:
-    """A caption letter or digit. Symbols and letterlike emoji do not count."""
+    """A caption letter or digit. Emoji (So/Sk) and letterlike emoji do not count."""
     if unicodedata.category(ch) in {"So", "Sk"} or "\u2100" <= ch <= "\u214F":
         return False
     return ch.isalpha() or ch.isdigit()
