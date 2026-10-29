@@ -288,6 +288,9 @@ class TelegramFetcher:
             tg_msg.forward_date = fwd.date
 
         # Decide from the combined caption and attachment identity before IO.
+        # Album captions are already joined; image-only uses that same text
+        # together with every attachment type in the group.
+        attachments = []
         for m in messages:
             if isinstance(m.media, MessageMediaPhoto):
                 media_type, mime = "image", "image/jpeg"
@@ -298,10 +301,13 @@ class TelegramFetcher:
                 mime = getattr(attachment, "mime_type", "") or ""
             else:
                 continue
+            attachments.append((m, media_type, mime, attachment))
+        post_media_types = [media_type for _, media_type, _, _ in attachments]
+        for m, media_type, mime, attachment in attachments:
             tg_msg.has_video |= media_type == "video"
             tg_msg.has_voice |= media_type in {"audio", "voice"}
             tg_msg.has_document |= media_type == "document"
-            operations = media_operations(combined_text, media_type)
+            operations = media_operations(combined_text, media_type, post_media_types=post_media_types)
             record = TelegramMedia(media_type=media_type, mime_type=mime, message_id=m.id,
                                    attachment_id=str(getattr(attachment, "id", "") or ""),
                                    analysis_operations=operations,
