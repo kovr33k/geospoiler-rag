@@ -22,6 +22,7 @@ from geospoiler.evaluation.baseline_probe import (
 from geospoiler.ingestion.enricher.pipeline import EnrichmentStats, enrich_all
 from geospoiler.ingestion.fetcher.state import get_all_progress, mark_message_processed
 from geospoiler.ingestion.fetcher.telegram_client import TelegramFetcher, TelegramMessage
+from geospoiler.ingestion.ingest_report import print_problem_posts_line
 from geospoiler.ingestion.normalizer.pipeline import (
     NormalizationBatchResult,
     _get_filepath,
@@ -29,6 +30,7 @@ from geospoiler.ingestion.normalizer.pipeline import (
     read_normalized_meta,
 )
 from geospoiler.ingestion.normalizer.review_queue import get_pending_reviews
+from geospoiler.ingestion.outcomes import close_outcome, failure_reason, record_open_outcome
 from geospoiler.operations.release_identity import safe_resolve_release_path
 from geospoiler.providers import llm_backend
 from geospoiler.retrieval.cards.card_fts import (
@@ -123,6 +125,7 @@ async def cmd_normalize(channel_messages: list[tuple[str, list[TelegramMessage]]
         logger.info(f"Processing channel: {channel_name} ({len(messages)} messages)")
 
         result = normalize_batch(messages)
+        _sync_normalization_outcomes(messages, result)
         successful_ids = {int(Path(fp).stem) for fp, _ in result.texts_with_paths}
         marked_count = _mark_contiguous_processed(messages, successful_ids)
         result.processed_messages += marked_count
@@ -363,6 +366,7 @@ async def cmd_run(limit: int | None = None):
         normalize_stats = NormalizationBatchResult()
         enrich_stats = cmd_enrich()
     _print_pipeline_summary(channel_messages, normalize_stats, enrich_stats)
+    print_problem_posts_line()
 
     logger.info("=== FULL PIPELINE COMPLETE ===")
 
@@ -404,6 +408,7 @@ def _normalize_into_queue(channel_messages, ready_paths, stop, consumer_done) ->
                     return summary
                 result = normalize_batch([msg])
                 summary.merge(result)
+                _sync_normalization_outcomes([msg], result)
                 for filepath, _ in result.texts_with_paths:
                     path = Path(filepath)
                     meta = read_normalized_meta(path)
@@ -468,6 +473,32 @@ def _clear_lightrag_query_cache() -> None:
         logger.info("Cleared LightRAG LLM response cache for rebuild.")
     except OSError as exc:
         logger.warning(f"Could not clear LightRAG LLM response cache: {exc}")
+
+
+def _sync_normalization_outcomes(
+    messages: list[TelegramMessage],
+    result: NormalizationBatchResult,
+) -> None:
+    """Record normalization failures and close outcomes of normalized posts.
+
+    The channel cursor is updated by the caller and is left unchanged here.
+    """
+    for failure in result.failures:
+        msg = failure.message
+        record_open_outcome(
+            channel_id=msg.channel_id,
+            channel_title=msg.channel_name,
+            channel_username=msg.channel_username,
+            message_id=msg.message_id,
+            post_url=msg.post_url,
+            stage="normalize",
+            outcome="failed",
+            reason=failure_reason(failure.error),
+        )
+    successful_ids = {int(Path(path).stem) for path, _ in result.texts_with_paths}
+    for msg in messages:
+        if msg.message_id in successful_ids:
+            close_outcome(msg.channel_id, msg.message_id)
 
 
 def _print_run_summary(

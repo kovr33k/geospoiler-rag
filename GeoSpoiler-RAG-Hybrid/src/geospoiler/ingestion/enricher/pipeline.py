@@ -153,6 +153,7 @@ def _collect_enrichment_jobs(
     force: bool,
     stats: EnrichmentStats,
     normalized_paths: list[Path] | None = None,
+    read_only: bool = False,
 ) -> list[_EnrichmentJob]:
     normalized_dir = config.NORMALIZED_DIR
     enriched_dir = config.ENRICHED_DIR
@@ -186,7 +187,8 @@ def _collect_enrichment_jobs(
                 continue
 
             try:
-                normalized_meta = read_normalized_meta(txt_path)
+                # A report must not recover an interrupted pair or stamp a card.
+                normalized_meta = read_normalized_meta(txt_path, recover=not read_only)
                 expected_source_id = _build_source_id(normalized_meta, channel_name, msg_id)
                 metadata_identity_valid = True
                 if normalized_meta.youtube_urls and _is_youtube_only_normalized_document(
@@ -210,6 +212,7 @@ def _collect_enrichment_jobs(
                     source_fingerprint,
                     out_path,
                     expected_source_id,
+                    write=not read_only,
                 )
             ):
                 stats.skipped_up_to_date += 1
@@ -984,11 +987,14 @@ def _migrate_non_media_contract(
     source_fingerprint: str,
     path: Path,
     expected_source_id: str | None,
+    *,
+    write: bool = True,
 ) -> bool:
     """Stamp media-contract-v2 without an LLM call when a source has no media.
 
     All semantic inputs and valid provenance must already match. A changed
     fingerprint or any structural mismatch stays on the normal enrichment path.
+    write=False returns the same decision and leaves the card file unchanged.
     """
     if key in progress.get("failed", {}):
         return False
@@ -1017,7 +1023,7 @@ def _migrate_non_media_contract(
         or not (card.summary.strip() or card.key_points)
     ):
         return False
-    if card.media_contract_version != _MEDIA_CONTRACT_VERSION:
+    if card.media_contract_version != _MEDIA_CONTRACT_VERSION and write:
         card.media_contract_version = _MEDIA_CONTRACT_VERSION
         temporary = path.with_name(f".{path.name}.media-contract.tmp")
         temporary.write_text(

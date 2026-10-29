@@ -448,13 +448,14 @@ def test_cancelled_run_drains_saved_work_and_resumes(ingestion_runtime, monkeypa
     assert all(path.read_bytes() == data for path, data in retained.items())
 
 
-def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=None):
-    """Control Telegram transport while retaining real fetch/group/media routing."""
-    mime = {"photo": "image/jpeg", "image_document": "image/png", "video": "video/mp4",
-            "audio": "audio/mpeg", "voice": "audio/ogg", "document": "text/plain", "pdf": "application/pdf"}[kind]
-    attachment = SimpleNamespace(id=456, mime_type=mime, size=24,
-                                 attributes=[SimpleNamespace(voice=kind == "voice")])
-    media = telegram.MessageMediaPhoto(photo=attachment) if kind == "photo" else telegram.MessageMediaDocument(document=attachment)
+def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=None, kinds=None, size=24):
+    """Control Telegram transport while retaining real fetch/group/media routing.
+
+    ``kinds`` emits one album: the caption is placed on the first message and
+    the saved post id is the highest message id.
+    """
+    selected = list(kinds) if kinds is not None else [kind]
+    grouped_id = 9001 if len(selected) > 1 else None
 
     async def download(file):
         if download_error:
@@ -464,11 +465,21 @@ def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=N
         return str(path)
 
     transport = AsyncMock(side_effect=download)
-    raw = SimpleNamespace(id=1, date=datetime(2026, 10, 25, tzinfo=UTC), message=caption,
-                          action=None, forward=None, media=media, grouped_id=None, download_media=transport)
+    raw_messages = []
+    for index, item_kind in enumerate(selected, start=1):
+        mime = {"photo": "image/jpeg", "image_document": "image/png", "video": "video/mp4",
+                "audio": "audio/mpeg", "voice": "audio/ogg", "document": "text/plain", "pdf": "application/pdf"}[item_kind]
+        attachment = SimpleNamespace(id=455 + index, mime_type=mime, size=size,
+                                     attributes=[SimpleNamespace(voice=item_kind == "voice")])
+        media = telegram.MessageMediaPhoto(photo=attachment) if item_kind == "photo" else telegram.MessageMediaDocument(document=attachment)
+        raw_messages.append(SimpleNamespace(
+            id=index, date=datetime(2026, 10, 25, tzinfo=UTC), message=caption if index == 1 else "",
+            action=None, forward=None, media=media, grouped_id=grouped_id, download_media=transport,
+        ))
 
     async def iterate(*args, **kwargs):
-        yield raw
+        for raw in raw_messages:
+            yield raw
 
     fetcher = telegram.TelegramFetcher.__new__(telegram.TelegramFetcher)
     fetcher.client = SimpleNamespace(start=AsyncMock(), disconnect=AsyncMock(), iter_messages=iterate)
@@ -527,17 +538,94 @@ def test_photo_event_noun_is_not_attachment_dependency(media_boundaries, monkeyp
     vision.assert_not_called()
 
 
-@pytest.mark.parametrize("caption", ["", "Смотрите", "🔥"])
-def test_media_only_or_vague_caption_retains_unanalyzed_source(media_boundaries, monkeypatch, caption):
+@pytest.mark.parametrize(("caption", "analyzed"), [
+    ("", True),
+    ("🔥", True),
+    ("#2026news", True),
+    ("#_tag", True),
+    ("\u2139\ufe0f", True),
+    ("www.example.com", True),
+    ("Смотрите", False),
+])
+def test_media_only_or_vague_caption_retains_unanalyzed_source(media_boundaries, monkeypatch, caption, analyzed):
     transport = run_raw_media(monkeypatch, "photo", caption)
+    vision, audio, marker = media_boundaries
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    assert meta["post_url"] == "https://t.me/acceptance/1"
+    assert resolve_source("telegram:123:1", db_path=config.SOURCE_REGISTRY_DB_PATH)
+    if analyzed:
+        transport.assert_awaited_once()
+        vision.assert_called_once()
+        audio.assert_not_called()
+        assert meta["media"][0]["analysis_status"] == "success"
+        assert marker in (config.NORMALIZED_DIR / "Acceptance/1.txt").read_text(encoding="utf-8")
+        card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
+        assert marker in card.search_text
+        assert search_card_index("порт", db_path=config.CARD_FTS_DB_PATH)
+    else:
+        transport.assert_not_called()
+        vision.assert_not_called()
+        audio.assert_not_called()
+        assert meta["media"][0]["analysis_status"] == "not_analyzed"
+
+
+def test_captionless_image_album_analyses_every_image(media_boundaries, monkeypatch):
+    transport = run_raw_media(monkeypatch, "photo", "", kinds=["photo", "photo", "photo"])
+    assert transport.await_count == 3
+    vision, audio, marker = media_boundaries
+    assert vision.call_count == 3
+    audio.assert_not_called()
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/3.meta.json").read_text(encoding="utf-8"))
+    assert [item["attachment_id"] for item in meta["media"]] == ["456", "457", "458"]
+    assert [item["analysis_status"] for item in meta["media"]] == ["success", "success", "success"]
+    normalized = (config.NORMALIZED_DIR / "Acceptance/3.txt").read_text(encoding="utf-8")
+    assert normalized.count(marker) == 3
+    card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/3.enriched.json").read_text(encoding="utf-8"))
+    assert marker in card.search_text
+    assert search_card_index("порт", db_path=config.CARD_FTS_DB_PATH)
+
+
+def test_album_caption_with_letters_skips_every_image(media_boundaries, monkeypatch):
+    transport = run_raw_media(monkeypatch, "photo", "Смотрите", kinds=["photo", "photo"])
+    transport.assert_not_called()
+    vision, audio, _ = media_boundaries
+    vision.assert_not_called()
+    audio.assert_not_called()
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/2.meta.json").read_text(encoding="utf-8"))
+    assert [item["analysis_status"] for item in meta["media"]] == ["not_analyzed", "not_analyzed"]
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "voice", "document"])
+def test_captionless_non_image_keeps_selective_skip(media_boundaries, monkeypatch, kind):
+    transport = run_raw_media(monkeypatch, kind, "")
     transport.assert_not_called()
     vision, audio, _ = media_boundaries
     vision.assert_not_called()
     audio.assert_not_called()
     meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
-    assert meta["post_url"] == "https://t.me/acceptance/1"
     assert meta["media"][0]["analysis_status"] == "not_analyzed"
-    assert resolve_source("telegram:123:1", db_path=config.SOURCE_REGISTRY_DB_PATH)
+
+
+@pytest.mark.parametrize("other", ["video", "document"])
+def test_captionless_image_with_other_media_is_not_image_only(media_boundaries, monkeypatch, other):
+    transport = run_raw_media(monkeypatch, "photo", "", kinds=["photo", other])
+    transport.assert_not_called()
+    vision, audio, _ = media_boundaries
+    vision.assert_not_called()
+    audio.assert_not_called()
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/2.meta.json").read_text(encoding="utf-8"))
+    assert [item["analysis_status"] for item in meta["media"]] == ["not_analyzed", "not_analyzed"]
+
+
+@pytest.mark.parametrize(("caption", "failure"), [("", "download"), ("", "analysis"), ("🔥", "download"), ("🔥", "analysis")])
+def test_image_only_failure_keeps_failed_analysis_status(media_boundaries, monkeypatch, caption, failure):
+    vision, _, _ = media_boundaries
+    if failure == "analysis":
+        vision.side_effect = llm_backend.LLMBackendError("controlled analysis failure")
+    run_raw_media(monkeypatch, "photo", caption, download_error=failure == "download")
+    meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
+    assert meta["media"][0]["analysis_status"] == "failed"
+    assert meta["media"][0]["error"] or meta["media"][0].get("visual_error")
 
 
 @pytest.mark.parametrize(("kind", "caption", "vision_count", "audio_count"), [

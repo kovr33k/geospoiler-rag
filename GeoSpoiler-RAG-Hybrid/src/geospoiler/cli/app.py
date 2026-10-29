@@ -35,6 +35,7 @@ from geospoiler.cli.tools import (
     cmd_validate_enriched,
 )
 from geospoiler.cli.wiki import cmd_wiki_rebuild, cmd_wiki_run, cmd_wiki_search, cmd_wiki_status
+from geospoiler.ingestion.ingest_report import cmd_ingest_report
 from geospoiler.providers import llm_backend
 
 CLI_DESCRIPTION = "Telegram-to-RAG pipeline for GeoSpoiler local memory."
@@ -165,6 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
     wiki_sub.add_parser("review")
 
     subparsers.add_parser("status")
+
+    report = subparsers.add_parser("ingest-report", help="List open ingestion problems")
+    report.add_argument("--json", action="store_true", dest="json_output", help="Print the report as JSON")
+    report.add_argument("--channel", help="Keep problems for this channel title")
+    report.add_argument(
+        "--category",
+        choices=("review", "retry", "failed", "policy"),
+        help="Keep problems with this label",
+    )
     return parser
 
 
@@ -226,6 +236,14 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             cmd_experiments_index()
             return
         print("Usage: python main.py experiments index")
+        return
+
+    if command == "ingest-report":
+        cmd_ingest_report(
+            channel=args.channel,
+            category=args.category,
+            as_json=args.json_output,
+        )
         return
 
     setup_logging()

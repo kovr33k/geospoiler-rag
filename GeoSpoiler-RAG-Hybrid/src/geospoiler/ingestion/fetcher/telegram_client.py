@@ -20,6 +20,7 @@ from telethon.tl.types import Channel, MessageMediaDocument, MessageMediaPhoto
 from geospoiler import config
 from geospoiler.ingestion.fetcher.state import get_last_message_id
 from geospoiler.ingestion.normalizer.media_selection import media_operations
+from geospoiler.ingestion.outcomes import close_outcome, failure_reason, record_open_outcome
 
 logger = logging.getLogger("geospoiler.fetcher")
 
@@ -288,6 +289,9 @@ class TelegramFetcher:
             tg_msg.forward_date = fwd.date
 
         # Decide from the combined caption and attachment identity before IO.
+        # Album captions are already joined; image-only uses that same text
+        # together with every attachment type in the group.
+        attachments = []
         for m in messages:
             if isinstance(m.media, MessageMediaPhoto):
                 media_type, mime = "image", "image/jpeg"
@@ -298,10 +302,13 @@ class TelegramFetcher:
                 mime = getattr(attachment, "mime_type", "") or ""
             else:
                 continue
+            attachments.append((m, media_type, mime, attachment))
+        post_media_types = [media_type for _, media_type, _, _ in attachments]
+        for m, media_type, mime, attachment in attachments:
             tg_msg.has_video |= media_type == "video"
             tg_msg.has_voice |= media_type in {"audio", "voice"}
             tg_msg.has_document |= media_type == "document"
-            operations = media_operations(combined_text, media_type)
+            operations = media_operations(combined_text, media_type, post_media_types=post_media_types)
             record = TelegramMedia(media_type=media_type, mime_type=mime, message_id=m.id,
                                    attachment_id=str(getattr(attachment, "id", "") or ""),
                                    analysis_operations=operations,
@@ -400,13 +407,33 @@ class TelegramFetcher:
         """
         Fetch new messages from ALL discovered channels.
         Returns {channel_title: [messages]}.
+
+        A fetch error is limited to that channel: it is written to the outcome
+        journal and the remaining channels are still fetched. Channel discovery
+        errors propagate.
         """
         channels = await self.discover_channels()
         all_messages = {}
 
         for ch in channels:
-            msgs = await self.fetch_channel_messages(ch, limit=limit_per_channel)
+            try:
+                msgs = await self.fetch_channel_messages(ch, limit=limit_per_channel)
+            except Exception as exc:
+                reason = failure_reason(exc)
+                record_open_outcome(
+                    channel_id=ch["id"],
+                    channel_title=ch["title"],
+                    channel_username=ch.get("name", "") or "",
+                    message_id=None,
+                    post_url=None,
+                    stage="fetch",
+                    outcome="failed",
+                    reason=reason,
+                )
+                logger.error(f"Fetch failed for '{ch['title']}' (id={ch['id']}): {reason}")
+                continue
             all_messages[ch["title"]] = msgs
+            close_outcome(ch["id"], None)
 
         return all_messages
 

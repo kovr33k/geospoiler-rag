@@ -21,7 +21,7 @@ from geospoiler.ingestion.normalizer.document_handler import extract_document_te
 from geospoiler.ingestion.normalizer.image_handler import describe_image
 from geospoiler.ingestion.normalizer.instagram_handler import extract_instagram_text
 from geospoiler.ingestion.normalizer.media_paths import portable_media_path, portable_project_path
-from geospoiler.ingestion.normalizer.media_selection import media_operations
+from geospoiler.ingestion.normalizer.media_selection import media_operations, strip_url_tokens
 from geospoiler.ingestion.normalizer.media_vision import VisualExtractionResult, analyze_image, analyze_video
 from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_EXTERNAL_LINK
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
@@ -52,10 +52,19 @@ class NormalizedMessageResult:
 
 
 @dataclass
+class NormalizationFailure:
+    """One message normalize_batch could not normalize, with the raised error."""
+
+    message: TelegramMessage
+    error: Exception
+
+
+@dataclass
 class NormalizationBatchResult:
     """Aggregated normalization output and content statistics for a batch."""
 
     texts_with_paths: list[tuple[str, str]] = field(default_factory=list)
+    failures: list[NormalizationFailure] = field(default_factory=list)
     messages_total: int = 0
     messages_with_text: int = 0
     messages_with_images: int = 0
@@ -83,6 +92,7 @@ class NormalizationBatchResult:
     def merge(self, other: "NormalizationBatchResult") -> None:
         """Merge another batch result into this one."""
         self.texts_with_paths.extend(other.texts_with_paths)
+        self.failures.extend(other.failures)
         self.messages_total += other.messages_total
         self.messages_with_text += other.messages_with_text
         self.messages_with_images += other.messages_with_images
@@ -273,7 +283,8 @@ def normalize_batch(messages: list[TelegramMessage]) -> NormalizationBatchResult
     """
     Normalize a batch of messages.
 
-    Returns normalized texts plus aggregate content/outcome statistics.
+    Returns normalized texts, failed messages with their errors, and aggregate
+    content/outcome statistics.
     """
     batch = NormalizationBatchResult()
 
@@ -296,6 +307,7 @@ def normalize_batch(messages: list[TelegramMessage]) -> NormalizationBatchResult
                 batch.skipped_messages += 1
         except Exception as e:
             batch.failed_messages += 1
+            batch.failures.append(NormalizationFailure(message=msg, error=e))
             logger.error(
                 f"  Error normalizing msg {msg.message_id} from '{msg.channel_name}': {e}",
                 exc_info=True,
@@ -423,10 +435,11 @@ def _build_media_sections(
     sections = []
     transcriptions = []
     visual_metadata = []
+    post_media_types = _post_media_types(classified)
     for item in classified.media:
         if item.media_type not in {"video", "audio", "voice", "document"}:
             continue
-        operations = _select_operations(item, msg.text)
+        operations = _select_operations(item, msg.text, post_media_types)
         if not operations:
             sections.append(_format_media_placeholder(item))
             continue
@@ -469,8 +482,24 @@ def _build_media_sections(
     return sections, transcriptions, visual_metadata
 
 
-def _select_operations(item: TelegramMedia, caption: str) -> list[str]:
-    operations = media_operations(caption, item.media_type)
+def _post_media_types(classified: ClassifiedMessage) -> list[str]:
+    """Attachment types for the whole post.
+
+    Legacy messages can carry ``has_video``, ``has_voice`` or ``has_document``
+    without a structured media record. Those flags still keep the post mixed.
+    """
+    types = [item.media_type for item in classified.media]
+    if classified.has_video:
+        types.append("video")
+    if classified.has_voice:
+        types.append("voice")
+    if classified.has_document:
+        types.append("document")
+    return types
+
+
+def _select_operations(item: TelegramMedia, caption: str, post_media_types: list[str]) -> list[str]:
+    operations = media_operations(caption, item.media_type, post_media_types=post_media_types)
     item.analysis_operations = operations
     item.selection_reason = "explicit_dependency" if operations else "no_explicit_dependency"
     return operations
@@ -493,12 +522,13 @@ def _build_image_sections(
     visual_metadata: list[dict] = []
     caption = msg.text or ""
     processed_paths: set[str] = set()
+    post_media_types = _post_media_types(classified)
 
     for item in classified.media:
         if item.media_type != "image":
             continue
         processed_paths.add(item.file_path)
-        operations = _select_operations(item, caption)
+        operations = _select_operations(item, caption, post_media_types)
         if not operations:
             visual = VisualExtractionResult(status="not_analyzed")
         elif item.file_path and item.download_status == "downloaded":
@@ -518,13 +548,14 @@ def _build_image_sections(
     # Keep compatibility with manually-created TelegramMessage objects that
     # predate the structured ``media`` records.  Real fetched images take the
     # unified VisualExtractionResult path above and are not analyzed twice.
-    for img_path in classified.image_paths:
-        if img_path in processed_paths:
-            continue
-        if media_operations(caption, "image"):
-            sections.append(describe_image(img_path, caption=caption))
-        else:
-            sections.append("[Изображение: вложение не анализировалось по выборочной политике]")
+    pending_paths = [img_path for img_path in classified.image_paths if img_path not in processed_paths]
+    if pending_paths:
+        pending_types = post_media_types + ["image"] * len(pending_paths)
+        for img_path in pending_paths:
+            if media_operations(caption, "image", post_media_types=pending_types):
+                sections.append(describe_image(img_path, caption=caption))
+            else:
+                sections.append("[Изображение: вложение не анализировалось по выборочной политике]")
 
     return sections, visual_metadata
 
@@ -662,7 +693,7 @@ def _strip_urls_from_text(text: str, urls: list[str]) -> str:
     # Telegram entities and message text can differ in punctuation, aliases,
     # or URL normalization. Remove any remaining URL token as a final guard so
     # a URL-only post cannot be misclassified as substantive body text.
-    result = re.sub(r"(?:https?://|www\.)[^\s<>\"']+", " ", result, flags=re.IGNORECASE)
+    result = strip_url_tokens(result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result.strip()
 
@@ -698,9 +729,14 @@ def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = No
     return filepath
 
 
-def read_normalized_meta(path: Path) -> NormalizedMeta:
-    """Validate saved input readiness, including interrupted pair publication."""
-    recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
+def read_normalized_meta(path: Path, recover: bool = True) -> NormalizedMeta:
+    """Validate saved input readiness, including interrupted pair publication.
+
+    recover=False reads the files as they are. An interrupted pair then fails
+    the hash check, and the next real run performs the recovery.
+    """
+    if recover:
+        recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
     text = path.read_bytes()
     if not text.decode("utf-8").strip():
         raise ValueError(f"Empty normalized text: {path}")
