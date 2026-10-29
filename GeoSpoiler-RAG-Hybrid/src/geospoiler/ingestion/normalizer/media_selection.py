@@ -74,7 +74,7 @@ def _is_image_only_post(text: str, media_types: Sequence[str]) -> bool:
     """True when the post is only images and the caption has no letters or digits."""
     if not media_types or any(kind != "image" for kind in media_types):
         return False
-    return not _caption_has_letters_or_digits(text)
+    return not caption_has_letters_or_digits(text)
 
 
 def strip_url_tokens(text: str) -> str:
@@ -82,7 +82,7 @@ def strip_url_tokens(text: str) -> str:
     return _URL_TOKEN_RE.sub(" ", text or "")
 
 
-def _caption_has_letters_or_digits(text: str) -> bool:
+def caption_has_letters_or_digits(text: str) -> bool:
     """Letters or digits left after URLs, hashtags and emoji are removed."""
     cleaned = strip_url_tokens(text)
     cleaned = _KEYCAP_RE.sub(" ", cleaned)

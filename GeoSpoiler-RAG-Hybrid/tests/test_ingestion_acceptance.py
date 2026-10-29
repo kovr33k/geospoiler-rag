@@ -448,7 +448,7 @@ def test_cancelled_run_drains_saved_work_and_resumes(ingestion_runtime, monkeypa
     assert all(path.read_bytes() == data for path, data in retained.items())
 
 
-def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=None, kinds=None):
+def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=None, kinds=None, size=24):
     """Control Telegram transport while retaining real fetch/group/media routing.
 
     ``kinds`` emits one album: the caption is placed on the first message and
@@ -469,7 +469,7 @@ def run_raw_media(monkeypatch, kind, caption, *, download_error=False, payload=N
     for index, item_kind in enumerate(selected, start=1):
         mime = {"photo": "image/jpeg", "image_document": "image/png", "video": "video/mp4",
                 "audio": "audio/mpeg", "voice": "audio/ogg", "document": "text/plain", "pdf": "application/pdf"}[item_kind]
-        attachment = SimpleNamespace(id=455 + index, mime_type=mime, size=24,
+        attachment = SimpleNamespace(id=455 + index, mime_type=mime, size=size,
                                      attributes=[SimpleNamespace(voice=item_kind == "voice")])
         media = telegram.MessageMediaPhoto(photo=attachment) if item_kind == "photo" else telegram.MessageMediaDocument(document=attachment)
         raw_messages.append(SimpleNamespace(

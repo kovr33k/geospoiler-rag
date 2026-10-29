@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from geospoiler import config
 from geospoiler.cli import app
 from geospoiler.cli import pipeline as cli
@@ -15,7 +17,14 @@ from geospoiler.ingestion.fetcher.telegram_client import TelegramMessage
 from geospoiler.ingestion.ingest_report import combine_problem_items
 from geospoiler.ingestion.normalizer import pipeline as normalization
 from geospoiler.ingestion.outcomes import record_open_outcome
-from tests.test_ingestion_acceptance import ingestion_runtime, message, run_messages  # noqa: F401
+from geospoiler.providers import llm_backend
+from tests.test_ingestion_acceptance import (  # noqa: F401
+    ingestion_runtime,
+    media_boundaries,
+    message,
+    run_messages,
+    run_raw_media,
+)
 
 RUSSIAN = "Сегодня власти сообщили, что новые переговоры состоятся после встречи министров."
 SECRET = "supersecret-value"
@@ -252,3 +261,167 @@ def test_journal_collector_skips_outcomes_from_other_stages(ingestion_runtime, c
     assert [item["stage"] for item in report["items"]] == ["normalize"]
     assert report["items"][0]["message_id"] == 1
     assert report["items"][0]["category"] == "retry"
+
+
+SCREENSHOT = "На скриншоте приведены данные о маршруте поставок."
+DOCUMENT = "В документе указаны подробности маршрута поставок."
+
+
+@pytest.mark.parametrize("failure", ["download", "analysis"])
+def test_selected_photo_failure_is_reported_as_failed(media_boundaries, monkeypatch, capsys, tmp_path, failure):
+    vision, _, _ = media_boundaries
+    if failure == "analysis":
+        vision.side_effect = llm_backend.LLMBackendError("controlled analysis failure")
+    run_raw_media(monkeypatch, "photo", SCREENSHOT, download_error=failure == "download")
+    assert "Проблемных постов: 1. Подробности: python main.py ingest-report" in capsys.readouterr().out
+
+    before = _snapshot(tmp_path)
+    report = _report(capsys)
+    assert _snapshot(tmp_path) == before
+    assert report["summary"]["by_category"]["failed"] == 1
+    item = report["items"][0]
+    assert item["channel_id"] == 123
+    assert item["channel_title"] == "Acceptance"
+    assert item["message_id"] == 1
+    assert item["post_url"] == "https://t.me/acceptance/1"
+    assert item["stage"] == "media"
+    assert item["category"] == "failed"
+    assert item["attempts"] is None
+    expected = "download_failed" if failure == "download" else "controlled analysis failure"
+    assert item["reason"] == f"image: {expected}"
+    assert item["blocks_cursor"] is False
+
+    app.main(["ingest-report", "--json", "--category", "policy"])
+    assert json.loads(capsys.readouterr().out)["items"] == []
+
+
+@pytest.mark.parametrize("caption", ["", "🔥", "#2026news", "www.example.com"])
+def test_video_without_meaningful_caption_is_policy(media_boundaries, monkeypatch, capsys, caption):
+    run_raw_media(monkeypatch, "video", caption)
+    capsys.readouterr()
+    report = _report(capsys)
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["stage"] == "media"
+    assert item["category"] == "policy"
+    assert item["channel_title"] == "Acceptance"
+    assert item["message_id"] == 1
+    assert item["post_url"] == "https://t.me/acceptance/1"
+    assert item["reason"] == "video: вложение не анализировалось по выборочной политике"
+    assert report["summary"]["by_category"]["failed"] == 0
+
+    app.main(["ingest-report", "--category", "policy"])
+    console = capsys.readouterr().out
+    assert "пропуск по политике" in console
+    assert "https://t.me/acceptance/1" in console
+    assert "ошибка обработки: 0" in console
+
+
+@pytest.mark.parametrize(("kind", "caption"), [
+    ("video", RUSSIAN),
+    ("video", "Смотрите"),
+    ("photo", RUSSIAN),
+    ("audio", RUSSIAN),
+    ("voice", RUSSIAN),
+    ("document", RUSSIAN),
+])
+def test_meaningful_caption_does_not_report_unselected_attachment(media_boundaries, monkeypatch, capsys, kind, caption):
+    run_raw_media(monkeypatch, kind, caption)
+    capsys.readouterr()
+    assert _report(capsys)["items"] == []
+
+
+def test_file_above_size_limit_is_policy_not_failure(media_boundaries, monkeypatch, capsys):
+    monkeypatch.setattr(config, "MEDIA_CAPTURE_MAX_BYTES", 1024)
+    run_raw_media(monkeypatch, "document", DOCUMENT, size=1025)
+    capsys.readouterr()
+    report = _report(capsys)
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["stage"] == "media"
+    assert item["category"] == "policy"
+    assert item["message_id"] == 1
+    assert "document" in item["reason"]
+    assert "file_size_exceeds_limit:1025>1024" in item["reason"]
+
+    app.main(["ingest-report", "--json", "--category", "failed"])
+    hidden = json.loads(capsys.readouterr().out)
+    assert hidden["items"] == []
+    assert hidden["summary"]["by_category"]["failed"] == 0
+
+
+def test_disabled_media_capture_is_policy_not_failure(media_boundaries, monkeypatch, capsys):
+    monkeypatch.setattr(config, "MEDIA_CAPTURE_ENABLED", False)
+    run_raw_media(monkeypatch, "photo", SCREENSHOT)
+    capsys.readouterr()
+    item = _report(capsys)["items"][0]
+    assert item["stage"] == "media"
+    assert item["category"] == "policy"
+    assert item["reason"] == "image: MEDIA_CAPTURE_ENABLED=false"
+
+    app.main(["ingest-report", "--json", "--category", "failed"])
+    assert json.loads(capsys.readouterr().out)["items"] == []
+
+
+def test_successful_attachment_is_absent_from_the_report(media_boundaries, monkeypatch, capsys):
+    run_raw_media(monkeypatch, "photo", SCREENSHOT)
+    capsys.readouterr()
+    report = _report(capsys)
+    assert report["items"] == []
+    assert report["summary"] == {"total": 0, "by_category": {"review": 0, "retry": 0, "failed": 0, "policy": 0}}
+
+
+def test_failed_text_extraction_is_reported(media_boundaries, monkeypatch, capsys):
+    run_raw_media(monkeypatch, "document", DOCUMENT, payload=b"\xff")
+    capsys.readouterr()
+    item = _report(capsys)["items"][0]
+    assert item["stage"] == "media"
+    assert item["category"] == "failed"
+    assert item["reason"].startswith("document: ")
+    assert "codec" in item["reason"] or "decode" in item["reason"]
+
+
+def test_several_policy_attachments_make_one_item(media_boundaries, monkeypatch, capsys):
+    run_raw_media(monkeypatch, "video", "", kinds=["video", "document"])
+    capsys.readouterr()
+    report = _report(capsys)
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["category"] == "policy"
+    assert item["stage"] == "media"
+    assert item["message_id"] == 2
+    assert item["post_url"] == "https://t.me/acceptance/2"
+    assert item["reason"] == "video, document (2): вложение не анализировалось по выборочной политике"
+
+
+def test_several_failed_attachments_make_one_item(media_boundaries, monkeypatch, capsys):
+    run_raw_media(monkeypatch, "photo", "", kinds=["photo", "photo"], download_error=True)
+    capsys.readouterr()
+    report = _report(capsys)
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["category"] == "failed"
+    assert item["stage"] == "media"
+    assert item["message_id"] == 2
+    assert item["reason"] == "image (2): download_failed"
+
+
+def test_failed_attachment_outranks_policy_skip_on_the_same_post(media_boundaries, monkeypatch, capsys):
+    monkeypatch.setattr(config, "MEDIA_CAPTURE_MAX_BYTES", 1024)
+    run_raw_media(
+        monkeypatch,
+        "photo",
+        "На скриншоте и в документе указаны подробности маршрута поставок.",
+        download_error=True,
+        kinds=["photo", "document"],
+        size=2048,
+    )
+    capsys.readouterr()
+    report = _report(capsys)
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["category"] == "failed"
+    assert item["stage"] == "media"
+    assert item["message_id"] == 2
+    assert item["reason"] == "image: download_failed"
+    assert "file_size_exceeds_limit" not in item["reason"]
