@@ -9,8 +9,11 @@ in ``COLLECTORS``.
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
+from geospoiler import config
 from geospoiler.ingestion.fetcher.state import get_last_message_id
+from geospoiler.ingestion.normalizer.media_selection import caption_has_letters_or_digits
 from geospoiler.ingestion.outcomes import read_open_outcomes
 
 logger = logging.getLogger("geospoiler.ingest_report")
@@ -206,3 +209,136 @@ def collect_fetch_problems() -> list[dict]:
 
 
 COLLECTORS.append(collect_fetch_problems)
+
+
+# Video, voice, audio and documents without a meaningful caption are policy
+# skips. Images are not: a post «только изображение» is selected for analysis.
+_POLICY_MEDIA_TYPES = {"video", "voice", "audio", "document"}
+_UNSELECTED_REASON = "вложение не анализировалось по выборочной политике"
+
+
+def _caption_from_normalized_text(text: str) -> str:
+    """User text, without the header and generated sections.
+
+    Generated sections (header, placeholders, analysis blocks) are paragraphs
+    that start with '['. Meaningful captions use caption_has_letters_or_digits.
+    """
+    kept = [paragraph for paragraph in text.split("\n\n") if not paragraph.lstrip().startswith("[")]
+    return "\n\n".join(kept)
+
+
+def _failure_detail(item: dict) -> str:
+    """Download error, otherwise visual, extraction or transcription error."""
+    error = str(item.get("error") or "")
+    if str(item.get("download_status") or "") == "failed" and error:
+        return error
+    for detail in (
+        item.get("visual_error"),
+        item.get("text_extraction_error"),
+        item.get("transcription_error"),
+        error,
+    ):
+        if detail:
+            return str(detail)
+    return "ошибка обработки"
+
+
+def _is_processing_failure(item: dict) -> bool:
+    return (
+        str(item.get("download_status") or "") == "failed"
+        or str(item.get("analysis_status") or "") == "failed"
+        or str(item.get("text_extraction_status") or "") == "failed"
+    )
+
+
+def _classify_attachment(item: dict, *, meaningful_caption: bool) -> tuple[str, str, str] | None:
+    """Return category, media type and detail. A policy skip is never a failure."""
+    if not isinstance(item, dict):
+        return None
+    media_type = str(item.get("media_type") or "attachment")
+    download_status = str(item.get("download_status") or "")
+    error = str(item.get("error") or "")
+    operations = item.get("analysis_operations")
+    selected = isinstance(operations, list) and bool(operations)
+    if download_status == "disabled":
+        return "policy", media_type, error or "MEDIA_CAPTURE_ENABLED=false"
+    if download_status == "skipped" and error.startswith("file_size_exceeds_limit"):
+        return "policy", media_type, error
+    if selected and _is_processing_failure(item):
+        return "failed", media_type, _failure_detail(item)
+    unselected = operations == [] or item.get("analysis_status") == "not_analyzed"
+    if unselected and media_type in _POLICY_MEDIA_TYPES and not meaningful_caption:
+        return "policy", media_type, _UNSELECTED_REASON
+    return None
+
+
+def _media_reason(problems: list[tuple[str, str]]) -> str:
+    """Types and, when a post has several problem attachments, their count."""
+    types: list[str] = []
+    details: list[str] = []
+    for media_type, detail in problems:
+        if media_type not in types:
+            types.append(media_type)
+        if detail and detail not in details:
+            details.append(detail)
+    type_part = ", ".join(types)
+    if len(problems) > 1:
+        type_part = f"{type_part} ({len(problems)})"
+    if not details:
+        return type_part
+    return f"{type_part}: {'; '.join(details)}"
+
+
+def _media_problem_item(text_path: Path) -> dict | None:
+    meta_path = text_path.with_suffix(".meta.json")
+    if not meta_path.is_file():
+        return None
+    try:
+        saved_text = text_path.read_text(encoding="utf-8")
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("Skipping unreadable normalized metadata: %s", text_path)
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    media = metadata.get("media")
+    if not isinstance(media, list) or not media:
+        return None
+    meaningful = caption_has_letters_or_digits(_caption_from_normalized_text(saved_text))
+    problems = []
+    for attachment in media:
+        classified = _classify_attachment(attachment, meaningful_caption=meaningful)
+        if classified is not None:
+            problems.append(classified)
+    if not problems:
+        return None
+    category = "failed" if any(item[0] == "failed" for item in problems) else "policy"
+    chosen = [(media_type, detail) for item_category, media_type, detail in problems if item_category == category]
+    return {
+        "channel_id": metadata.get("channel_id"),
+        "channel_title": metadata.get("channel_name"),
+        "message_id": metadata.get("message_id"),
+        "post_url": metadata.get("post_url"),
+        "stage": "media",
+        "category": category,
+        "reason": _media_reason(chosen),
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+    }
+
+
+def collect_media_problems() -> list[dict]:
+    """Attachment problems from normalized metadata. One item per post, stage media."""
+    root = config.NORMALIZED_DIR
+    if not root.is_dir():
+        return []
+    items = []
+    for text_path in sorted(root.rglob("*.txt")):
+        item = _media_problem_item(text_path)
+        if item is not None:
+            items.append(item)
+    return items
+
+
+COLLECTORS.append(collect_media_problems)
