@@ -23,7 +23,6 @@ from geospoiler.ingestion.enricher.pipeline import EnrichmentStats, enrich_all
 from geospoiler.ingestion.fetcher.state import get_all_progress, mark_message_processed
 from geospoiler.ingestion.fetcher.telegram_client import TelegramFetcher, TelegramMessage
 from geospoiler.ingestion.ingest_report import print_problem_posts_line
-from geospoiler.ingestion.outcomes import close_outcome, failure_reason, record_open_outcome
 from geospoiler.ingestion.normalizer.pipeline import (
     NormalizationBatchResult,
     _get_filepath,
@@ -31,6 +30,7 @@ from geospoiler.ingestion.normalizer.pipeline import (
     read_normalized_meta,
 )
 from geospoiler.ingestion.normalizer.review_queue import get_pending_reviews
+from geospoiler.ingestion.outcomes import close_outcome, failure_reason, record_open_outcome
 from geospoiler.operations.release_identity import safe_resolve_release_path
 from geospoiler.providers import llm_backend
 from geospoiler.retrieval.cards.card_fts import (

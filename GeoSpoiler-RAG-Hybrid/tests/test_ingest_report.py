@@ -21,13 +21,12 @@ from geospoiler.ingestion.ingest_report import combine_problem_items
 from geospoiler.ingestion.normalizer import pipeline as normalization
 from geospoiler.ingestion.outcomes import record_open_outcome
 from geospoiler.providers import llm_backend
-from tests.test_ingestion_acceptance import (  # noqa: F401
-    ingestion_runtime,
-    media_boundaries,
-    message,
-    run_messages,
-    run_raw_media,
-)
+from tests import test_ingestion_acceptance as acceptance
+from tests.test_ingestion_acceptance import message, run_messages, run_raw_media
+
+# Reuse the acceptance fixtures; pytest finds them by these module-level names.
+ingestion_runtime = acceptance.ingestion_runtime
+media_boundaries = acceptance.media_boundaries
 
 RUSSIAN = "Сегодня власти сообщили, что новые переговоры состоятся после встречи министров."
 SECRET = "supersecret-value"
