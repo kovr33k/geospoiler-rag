@@ -20,6 +20,7 @@ from telethon.tl.types import Channel, MessageMediaDocument, MessageMediaPhoto
 from geospoiler import config
 from geospoiler.ingestion.fetcher.state import get_last_message_id
 from geospoiler.ingestion.normalizer.media_selection import media_operations
+from geospoiler.ingestion.outcomes import close_outcome, failure_reason, record_open_outcome
 
 logger = logging.getLogger("geospoiler.fetcher")
 
@@ -406,13 +407,33 @@ class TelegramFetcher:
         """
         Fetch new messages from ALL discovered channels.
         Returns {channel_title: [messages]}.
+
+        A fetch error is limited to that channel: it is written to the outcome
+        journal and the remaining channels are still fetched. Channel discovery
+        errors propagate.
         """
         channels = await self.discover_channels()
         all_messages = {}
 
         for ch in channels:
-            msgs = await self.fetch_channel_messages(ch, limit=limit_per_channel)
+            try:
+                msgs = await self.fetch_channel_messages(ch, limit=limit_per_channel)
+            except Exception as exc:
+                reason = failure_reason(exc)
+                record_open_outcome(
+                    channel_id=ch["id"],
+                    channel_title=ch["title"],
+                    channel_username=ch.get("name", "") or "",
+                    message_id=None,
+                    post_url=None,
+                    stage="fetch",
+                    outcome="failed",
+                    reason=reason,
+                )
+                logger.error(f"Fetch failed for '{ch['title']}' (id={ch['id']}): {reason}")
+                continue
             all_messages[ch["title"]] = msgs
+            close_outcome(ch["id"], None)
 
         return all_messages
 
