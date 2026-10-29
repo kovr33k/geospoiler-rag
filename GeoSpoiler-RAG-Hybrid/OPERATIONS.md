@@ -259,7 +259,6 @@ TRANSCRIPTION_ENABLED
 TRANSCRIPTION_API_KEY
 TRANSCRIPTION_BASE_URL
 TRANSCRIPTION_MODEL
-TRANSCRIPTION_STT_MODEL
 TRANSCRIPTION_LANGUAGE
 TRANSCRIPTION_TIMEOUT_SECONDS
 ```
@@ -267,12 +266,11 @@ TRANSCRIPTION_TIMEOUT_SECONDS
 New native media transcripts are attached during normalization when
 `TRANSCRIPTION_ENABLED=true` and downloaded media is available.
 
-The primary route sends normalized audio to OpenRouter `/chat/completions`
-using `TRANSCRIPTION_MODEL` (Gemini audio input). Video files are converted to
-mono mp3 before upload. HTTP contract errors use the JSON/base64
-`/audio/transcriptions` fallback with `TRANSCRIPTION_STT_MODEL`; both routes
-record a failed status and response detail instead of silently treating the
-media as successfully processed.
+Telegram, Instagram and YouTube audio use OpenRouter `/audio/transcriptions`
+with the single `TRANSCRIPTION_MODEL` (`openai/whisper-large-v3` by default).
+Video files are converted to mono mp3 before upload. There is no second model
+or chat-audio fallback. Failed requests retain their status, response detail and
+attempt timing instead of being treated as successfully processed.
 
 For old downloaded media, use controlled backfill:
 

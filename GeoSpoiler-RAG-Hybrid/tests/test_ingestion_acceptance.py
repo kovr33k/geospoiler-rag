@@ -495,10 +495,11 @@ def media_boundaries(ingestion_runtime, monkeypatch):
     monkeypatch.setattr(config, "MEDIA_CAPTURE_ENABLED", True)
     monkeypatch.setattr(config, "TRANSCRIPTION_ENABLED", True)
     monkeypatch.setattr(config, "TRANSCRIPTION_API_KEY", "offline-test-key")
+    monkeypatch.setattr(config, "TRANSCRIPTION_MODEL", "openai/whisper-large-v3")
     marker = "Маршрут поставок проходит через порт."
     vision = Mock(return_value=marker)
     audio = Mock(return_value=SimpleNamespace(ok=True, status_code=200,
-                 json=lambda: {"choices": [{"message": {"content": marker}}]}))
+                 json=lambda: {"text": marker}))
     monkeypatch.setattr(llm_backend, "complete_media_analysis_sync", vision)
     monkeypatch.setattr(transcription_handler.requests, "post", audio)
     monkeypatch.setattr(llm_backend, "complete_text_sync", lambda messages, **kwargs: messages[-1]["content"].replace("The route crosses the port.", marker))
@@ -641,6 +642,9 @@ def test_explicit_attachment_dependency_reaches_card_and_search(media_boundaries
     vision, audio, marker = media_boundaries
     assert vision.call_count == vision_count
     assert audio.call_count == audio_count
+    if audio_count:
+        assert audio.call_args.args[0].endswith("/audio/transcriptions")
+        assert audio.call_args.kwargs["json"]["model"] == "openai/whisper-large-v3"
     meta = json.loads((config.NORMALIZED_DIR / "Acceptance/1.meta.json").read_text(encoding="utf-8"))
     assert meta["media"][0]["analysis_status"] == "success"
     card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
@@ -684,6 +688,9 @@ def test_video_dependency_runs_only_required_operation(media_boundaries, monkeyp
     vision, audio, marker = media_boundaries
     assert vision.call_count == (operation == "vision")
     assert audio.call_count == (operation == "transcribe")
+    if operation == "transcribe":
+        assert audio.call_args.args[0].endswith("/audio/transcriptions")
+        assert audio.call_args.kwargs["json"]["model"] == "openai/whisper-large-v3"
     assert frames.call_count == (operation == "vision")
     card = EnrichedCardV2.model_validate_json((config.ENRICHED_DIR / "Acceptance/1.enriched.json").read_text(encoding="utf-8"))
     assert marker in card.search_text
