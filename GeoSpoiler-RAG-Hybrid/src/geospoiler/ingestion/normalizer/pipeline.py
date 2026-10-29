@@ -710,9 +710,14 @@ def _save_normalized(msg: TelegramMessage, text: str, metadata: dict | None = No
     return filepath
 
 
-def read_normalized_meta(path: Path) -> NormalizedMeta:
-    """Validate saved input readiness, including interrupted pair publication."""
-    recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
+def read_normalized_meta(path: Path, recover: bool = True) -> NormalizedMeta:
+    """Validate saved input readiness, including interrupted pair publication.
+
+    recover=False reads the files as they are. An interrupted pair then fails
+    the hash check, and the next real run performs the recovery.
+    """
+    if recover:
+        recover_atomic_pair(path, path.with_suffix(".meta.json"), journal_suffix="normalized")
     text = path.read_bytes()
     if not text.decode("utf-8").strip():
         raise ValueError(f"Empty normalized text: {path}")

@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from geospoiler import config
 from geospoiler.cli import app
@@ -15,6 +18,7 @@ from geospoiler.ingestion.fetcher.telegram_client import TelegramMessage
 from geospoiler.ingestion.ingest_report import combine_problem_items
 from geospoiler.ingestion.normalizer import pipeline as normalization
 from geospoiler.ingestion.outcomes import record_open_outcome
+from geospoiler.providers import llm_backend
 from tests.test_ingestion_acceptance import ingestion_runtime, message, run_messages  # noqa: F401
 
 RUSSIAN = "Сегодня власти сообщили, что новые переговоры состоятся после встречи министров."
@@ -30,6 +34,15 @@ def _snapshot(root: Path) -> list[tuple[str, int, bytes | None]]:
         else:
             rows.append((path.relative_to(root).as_posix(), path.stat().st_mtime_ns, None))
     return rows
+
+
+def _watched_snapshot() -> dict[str, list]:
+    return {
+        "state": _snapshot(config.STATE_DIR),
+        "normalized": _snapshot(config.NORMALIZED_DIR),
+        "enriched": _snapshot(config.ENRICHED_DIR),
+        "review": _snapshot(config.REVIEW_QUEUE_DIR),
+    }
 
 
 def _report(capsys) -> dict:
@@ -206,7 +219,22 @@ def test_normalize_command_records_and_closes_outcomes(ingestion_runtime, monkey
     fail["on"] = False
     app.main(["normalize"])
     capsys.readouterr()
-    assert _report(capsys)["items"] == []
+    cleared = _report(capsys)
+    assert cleared["items"] == [{
+        "channel_id": 123,
+        "channel_title": "Acceptance",
+        "message_id": 1,
+        "post_url": "https://t.me/acceptance/1",
+        "stage": "enrich",
+        "category": "retry",
+        "reason": "нет актуальной карточки",
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+        "blocks_cursor": False,
+    }]
+    journal = json.loads((config.STATE_DIR / "ingestion_outcomes.json").read_text(encoding="utf-8"))
+    assert "123:1" not in journal["outcomes"]
     assert state.get_last_message_id(123) == 1
 
 
@@ -252,3 +280,264 @@ def test_journal_collector_skips_outcomes_from_other_stages(ingestion_runtime, c
     assert [item["stage"] for item in report["items"]] == ["normalize"]
     assert report["items"][0]["message_id"] == 1
     assert report["items"][0]["category"] == "retry"
+
+
+WEB = "https://example.com/negotiations"
+
+
+def test_enrichment_failure_is_retry_while_its_review_item_exists(ingestion_runtime, monkeypatch, capsys):
+    def fail_enrichment(messages, *, role, **kwargs):
+        raise RuntimeError("controlled enrichment failure")
+
+    monkeypatch.setattr(llm_backend, "complete_json_sync", fail_enrichment)
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    output = capsys.readouterr().out
+    assert "Проблемных постов: 1. Подробности: python main.py ingest-report" in output
+    pending = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.REVIEW_QUEUE_DIR.glob("*.json")
+    ]
+    assert any(item.get("review_type") == "enrichment_failure" and item.get("status") == "pending" for item in pending)
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert report["summary"] == {"total": 1, "by_category": {"review": 0, "retry": 1, "failed": 0, "policy": 0}}
+    assert report["items"] == [{
+        "channel_id": 123,
+        "channel_title": "Acceptance",
+        "message_id": 1,
+        "post_url": "https://t.me/acceptance/1",
+        "stage": "enrich",
+        "category": "retry",
+        "reason": "нет актуальной карточки",
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+        "blocks_cursor": False,
+    }]
+
+
+def test_external_link_is_review_and_a_ready_card_is_omitted(ingestion_runtime, monkeypatch, capsys):
+    run_messages(monkeypatch, [
+        message(RUSSIAN, 1),
+        message(f"{RUSSIAN} {WEB}", 2, urls=[WEB]),
+    ])
+    assert "Проблемных постов: 1. Подробности: python main.py ingest-report" in capsys.readouterr().out
+    assert (config.ENRICHED_DIR / "Acceptance/1.enriched.json").is_file()
+    assert (config.ENRICHED_DIR / "Acceptance/2.enriched.json").is_file()
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    app.main(["ingest-report"])
+    console = capsys.readouterr().out
+    app.main(["ingest-report", "--json", "--category", "review"])
+    reviewed = json.loads(capsys.readouterr().out)
+    app.main(["ingest-report", "--json", "--category", "retry"])
+    hidden = json.loads(capsys.readouterr().out)
+    assert _watched_snapshot() == before
+
+    assert report["summary"] == {"total": 1, "by_category": {"review": 1, "retry": 0, "failed": 0, "policy": 0}}
+    assert report["items"] == [{
+        "channel_id": 123,
+        "channel_title": "Acceptance",
+        "message_id": 2,
+        "post_url": "https://t.me/acceptance/2",
+        "stage": "review",
+        "category": "review",
+        "reason": "external_link: External web link",
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+        "blocks_cursor": False,
+    }]
+    assert reviewed["items"] == report["items"]
+    assert hidden["items"] == []
+    assert "ожидает ревью" in console
+    assert "https://t.me/acceptance/2" in console
+    assert "https://t.me/acceptance/1" not in console
+
+
+def test_external_link_without_a_card_keeps_one_review_label(ingestion_runtime, monkeypatch, capsys):
+    run_messages(monkeypatch, [message(f"{RUSSIAN} {WEB}", urls=[WEB])])
+    capsys.readouterr()
+    (config.ENRICHED_DIR / "Acceptance/1.enriched.json").unlink()
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert report["summary"] == {"total": 1, "by_category": {"review": 1, "retry": 0, "failed": 0, "policy": 0}}
+    assert report["items"][0]["category"] == "review"
+    assert report["items"][0]["stage"] == "review"
+    assert report["items"][0]["reason"] == "external_link: External web link"
+    assert report["items"][0]["channel_id"] == 123
+    assert report["items"][0]["message_id"] == 1
+
+
+def test_unstable_card_is_waiting_for_enrichment(ingestion_runtime, monkeypatch, capsys):
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    capsys.readouterr()
+    card_file = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
+    card = json.loads(card_file.read_text(encoding="utf-8"))
+    card["quality_flags"] = ["extraction_unstable"]
+    card_file.write_text(json.dumps(card), encoding="utf-8")
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert [item["message_id"] for item in report["items"]] == [1]
+    assert report["items"][0]["category"] == "retry"
+    assert report["items"][0]["stage"] == "enrich"
+    assert report["items"][0]["reason"] == "нет актуальной карточки"
+
+
+def test_report_does_not_stamp_a_legacy_media_contract(ingestion_runtime, monkeypatch, capsys):
+    run_messages(monkeypatch, [message(RUSSIAN)])
+    capsys.readouterr()
+    card_file = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
+    card = json.loads(card_file.read_text(encoding="utf-8"))
+    card["media_contract_version"] = "legacy-contract"
+    card_file.write_text(json.dumps(card), encoding="utf-8")
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert report["items"] == []
+
+
+def test_review_without_metadata_keeps_empty_channel_id(ingestion_runtime, capsys):
+    queue = config.REVIEW_QUEUE_DIR
+    (queue / "missing_external.json").write_text(json.dumps({
+        "review_type": "external_link",
+        "url": "https://example.com/orphan",
+        "channel": "Missing",
+        "message_id": 9,
+        "reason": "",
+        "status": "pending",
+    }), encoding="utf-8")
+    (queue / "missing_failure.json").write_text(json.dumps({
+        "review_type": "enrichment_failure",
+        "url": "https://t.me/missing/8",
+        "channel": "Missing",
+        "message_id": 8,
+        "reason": "Enrichment failed after bounded retry",
+        "status": "pending",
+    }), encoding="utf-8")
+    (queue / "done.json").write_text(json.dumps({
+        "review_type": "external_link",
+        "url": "https://example.com/done",
+        "channel": "Missing",
+        "message_id": 7,
+        "reason": "External web link",
+        "status": "processed",
+    }), encoding="utf-8")
+
+    before = _watched_snapshot()
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert report["items"] == [{
+        "channel_id": None,
+        "channel_title": "Missing",
+        "message_id": 9,
+        "post_url": None,
+        "stage": "review",
+        "category": "review",
+        "reason": "external_link: https://example.com/orphan",
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+        "blocks_cursor": False,
+    }]
+
+
+def test_report_leaves_an_interrupted_normalized_pair_unchanged(ingestion_runtime, monkeypatch, capsys):
+    path = normalization._save_normalized(
+        message(RUSSIAN),
+        "Original text",
+        {
+            "channel_name": "Acceptance",
+            "channel_id": 123,
+            "message_id": 1,
+            "post_url": "https://t.me/acceptance/1",
+            "date": "2026-01-01",
+        },
+    )
+    meta_path = path.with_suffix(".meta.json")
+    old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    real_replace = os.replace
+
+    def interrupt(source, target):
+        if Path(target) == meta_path:
+            raise KeyboardInterrupt("controlled interruption before sidecar publication")
+        return real_replace(source, target)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(os, "replace", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            normalization._save_normalized(
+                message(RUSSIAN),
+                "Replacement text",
+                {**old_meta, "date": "2026-10-25"},
+            )
+
+    journal = meta_path.with_name(f".{meta_path.name}.normalized.journal")
+    assert journal.is_file()
+    before = _watched_snapshot()
+    assert any(row[0].endswith(journal.name) for row in before["normalized"])
+    report = _report(capsys)
+    assert _watched_snapshot() == before
+    assert report["items"] == [{
+        "channel_id": 123,
+        "channel_title": "Acceptance",
+        "message_id": 1,
+        "post_url": "https://t.me/acceptance/1",
+        "stage": "enrich",
+        "category": "retry",
+        "reason": "нет актуальной карточки",
+        "attempts": None,
+        "first_seen": None,
+        "last_seen": None,
+        "blocks_cursor": True,
+    }]
+
+
+def test_review_keeps_unsanitized_channel_title(ingestion_runtime, capsys):
+    msg = TelegramMessage(
+        channel_name="World/News",
+        channel_id=789,
+        channel_username="worldnews",
+        message_id=4,
+        date=datetime(2026, 10, 25, tzinfo=UTC),
+        text=RUSSIAN,
+    )
+    normalization._save_normalized(msg, RUSSIAN, {
+        "channel_name": "World/News",
+        "channel_id": 789,
+        "channel_username": "worldnews",
+        "message_id": 4,
+        "post_url": "https://t.me/worldnews/4",
+    })
+    (config.REVIEW_QUEUE_DIR / "World_News_4_uninformative.json").write_text(json.dumps({
+        "review_type": "uninformative",
+        "url": "",
+        "channel": "World_News",
+        "message_id": 4,
+        "reason": "insufficient content",
+        "status": "pending",
+    }), encoding="utf-8")
+
+    before = _watched_snapshot()
+    app.main(["ingest-report", "--json", "--channel", "World/News"])
+    report = json.loads(capsys.readouterr().out)
+    app.main(["ingest-report", "--json", "--channel", "World_News"])
+    hidden = json.loads(capsys.readouterr().out)
+    assert _watched_snapshot() == before
+    assert report["summary"]["total"] == 1
+    item = report["items"][0]
+    assert item["channel_title"] == "World/News"
+    assert item["category"] == "review"
+    assert item["stage"] == "review"
+    assert item["channel_id"] == 789
+    assert item["message_id"] == 4
+    assert item["reason"] == "uninformative: insufficient content"
+    assert hidden["items"] == []
