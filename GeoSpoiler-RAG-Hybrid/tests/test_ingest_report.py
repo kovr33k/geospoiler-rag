@@ -4,14 +4,18 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from geospoiler import config
 from geospoiler.cli import app
 from geospoiler.cli import pipeline as cli
+from geospoiler.contracts.models import EnrichedCardV2
 from geospoiler.ingestion import ingest_report
 from geospoiler.ingestion.fetcher import state
-from geospoiler.ingestion.fetcher.telegram_client import TelegramMessage
+from geospoiler.ingestion.fetcher.telegram_client import TelegramFetcher, TelegramMessage
 from geospoiler.ingestion.ingest_report import combine_problem_items
 from geospoiler.ingestion.normalizer import pipeline as normalization
 from geospoiler.ingestion.outcomes import record_open_outcome
@@ -227,7 +231,7 @@ def test_run_continues_when_the_report_cannot_be_built(ingestion_runtime, monkey
     assert (config.ENRICHED_DIR / "Acceptance/1.enriched.json").is_file()
 
 
-def test_journal_collector_skips_outcomes_from_other_stages(ingestion_runtime, capsys):
+def test_fetch_and_normalize_journal_outcomes_are_reported(ingestion_runtime, capsys):
     record_open_outcome(
         channel_id=123,
         channel_title="Acceptance",
@@ -249,6 +253,144 @@ def test_journal_collector_skips_outcomes_from_other_stages(ingestion_runtime, c
         reason="RuntimeError: normalize failed",
     )
     report = _report(capsys)
-    assert [item["stage"] for item in report["items"]] == ["normalize"]
-    assert report["items"][0]["message_id"] == 1
-    assert report["items"][0]["category"] == "retry"
+    assert [(item["stage"], item["message_id"], item["category"]) for item in report["items"]] == [
+        ("normalize", 1, "retry"),
+        ("fetch", None, "retry"),
+    ]
+    assert report["items"][1]["reason"] == "fetch failed"
+    assert report["items"][1]["blocks_cursor"] is False
+    assert report["summary"]["total"] == 2
+    assert report["summary"]["by_category"]["retry"] == 2
+
+
+BROKEN_ID = 111
+HEALTHY_ID = 222
+FETCH_FAILURE = f"controlled channel fetch failure https://files.example/a?token={SECRET}"
+
+
+def _raw_post(text, message_id=1):
+    return SimpleNamespace(
+        id=message_id,
+        date=datetime(2026, 10, 25, tzinfo=UTC),
+        message=text,
+        action=None,
+        forward=None,
+        media=None,
+        grouped_id=None,
+    )
+
+
+def _install_fetcher(monkeypatch, channels, iterate):
+    fetcher = TelegramFetcher.__new__(TelegramFetcher)
+    fetcher.client = SimpleNamespace(start=AsyncMock(), disconnect=AsyncMock(), iter_messages=iterate)
+    fetcher.discover_channels = AsyncMock(return_value=channels)
+    monkeypatch.setattr(cli, "TelegramFetcher", Mock(return_value=fetcher))
+
+
+def test_fetch_failure_of_one_channel_still_reaches_cards_for_the_other(
+    ingestion_runtime, monkeypatch, capsys, caplog,
+):
+    failing = {"on": True}
+    seen = []
+
+    async def iterate(entity, min_id=0, **kwargs):
+        seen.append(entity)
+        if entity == BROKEN_ID and failing["on"]:
+            raise RuntimeError(FETCH_FAILURE)
+        raw = _raw_post(RUSSIAN)
+        if raw.id <= min_id:
+            return
+        yield raw
+
+    _install_fetcher(monkeypatch, [
+        {"id": BROKEN_ID, "title": "Broken", "name": "broken"},
+        {"id": HEALTHY_ID, "title": "Healthy", "name": "healthy"},
+    ], iterate)
+
+    asyncio.run(cli.cmd_run())
+    assert seen == [BROKEN_ID, HEALTHY_ID]
+    run_output = capsys.readouterr().out
+    assert "Проблемных постов: 1. Подробности: python main.py ingest-report" in run_output
+    fetch_logs = [record.getMessage() for record in caplog.records if record.name == "geospoiler.fetcher"]
+    assert any(f"Fetch failed for 'Broken' (id={BROKEN_ID})" in message for message in fetch_logs)
+    assert all(SECRET not in message for message in fetch_logs)
+
+    journal_path = config.STATE_DIR / "ingestion_outcomes.json"
+    stored = json.loads(journal_path.read_text(encoding="utf-8"))["outcomes"][str(BROKEN_ID)]
+    assert stored["outcome"] == "failed"
+    assert stored["stage"] == "fetch"
+    assert stored["message_id"] is None
+    assert stored["attempts"] == 1
+    assert SECRET not in journal_path.read_text(encoding="utf-8")
+    first_seen = stored["first_seen"]
+
+    report = _report(capsys)
+    assert report["summary"] == {"total": 1, "by_category": {"review": 0, "retry": 1, "failed": 0, "policy": 0}}
+    item = report["items"][0]
+    assert item["channel_id"] == BROKEN_ID
+    assert item["channel_title"] == "Broken"
+    assert item["message_id"] is None
+    assert item["post_url"] is None
+    assert item["stage"] == "fetch"
+    assert item["category"] == "retry"
+    assert item["attempts"] == 1
+    assert item["first_seen"] == first_seen
+    assert item["blocks_cursor"] is False
+    assert item["reason"].startswith("RuntimeError:")
+    assert "controlled channel fetch failure" in item["reason"]
+    assert SECRET not in item["reason"]
+    assert "[REDACTED]" in item["reason"] or "%5BREDACTED%5D" in item["reason"]
+
+    healthy = EnrichedCardV2.model_validate_json(
+        (config.ENRICHED_DIR / "Healthy" / "1.enriched.json").read_text(encoding="utf-8")
+    )
+    assert healthy.provenance.source_id == f"telegram:{HEALTHY_ID}:1"
+    assert healthy.provenance.post_url == "https://t.me/healthy/1"
+    assert not (config.ENRICHED_DIR / "Broken" / "1.enriched.json").exists()
+    assert state.get_last_message_id(BROKEN_ID) == 0
+    assert state.get_last_message_id(HEALTHY_ID) == 1
+
+    asyncio.run(cli.cmd_run())
+    assert seen == [BROKEN_ID, HEALTHY_ID, BROKEN_ID, HEALTHY_ID]
+    capsys.readouterr()
+    again = _report(capsys)
+    assert again["summary"]["total"] == 1
+    assert again["items"][0]["attempts"] == 2
+    assert again["items"][0]["first_seen"] == first_seen
+    assert again["items"][0]["message_id"] is None
+    assert again["items"][0]["category"] == "retry"
+    assert again["items"][0]["channel_id"] == BROKEN_ID
+    assert state.get_last_message_id(BROKEN_ID) == 0
+    assert (config.ENRICHED_DIR / "Healthy" / "1.enriched.json").is_file()
+
+    failing["on"] = False
+    asyncio.run(cli.cmd_run())
+    assert "Проблемных постов: 0. Подробности: python main.py ingest-report" in capsys.readouterr().out
+    assert _report(capsys)["items"] == []
+    assert str(BROKEN_ID) not in json.loads(journal_path.read_text(encoding="utf-8"))["outcomes"]
+    recovered = EnrichedCardV2.model_validate_json(
+        (config.ENRICHED_DIR / "Broken" / "1.enriched.json").read_text(encoding="utf-8")
+    )
+    assert recovered.provenance.source_id == f"telegram:{BROKEN_ID}:1"
+    assert recovered.provenance.post_url == "https://t.me/broken/1"
+    assert state.get_last_message_id(BROKEN_ID) == 1
+
+
+def test_channel_discovery_failure_still_stops_the_run(ingestion_runtime, monkeypatch):
+    fetched = []
+
+    async def iterate(entity, **kwargs):
+        fetched.append(entity)
+        yield _raw_post(RUSSIAN)
+
+    fetcher = TelegramFetcher.__new__(TelegramFetcher)
+    fetcher.client = SimpleNamespace(start=AsyncMock(), disconnect=AsyncMock(), iter_messages=iterate)
+    fetcher.discover_channels = AsyncMock(side_effect=RuntimeError("folder lookup failed"))
+    monkeypatch.setattr(cli, "TelegramFetcher", Mock(return_value=fetcher))
+
+    with pytest.raises(RuntimeError, match="folder lookup failed"):
+        asyncio.run(cli.cmd_run())
+
+    assert fetched == []
+    assert not (config.STATE_DIR / "ingestion_outcomes.json").exists()
+    assert not list(config.ENRICHED_DIR.rglob("*.enriched.json"))

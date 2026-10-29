@@ -180,3 +180,29 @@ def print_problem_posts_line() -> None:
         print(f"Проблемных постов: {total}. Подробности: python main.py ingest-report")
     except Exception:
         logger.exception("Could not build ingest report")
+
+
+def collect_fetch_problems() -> list[dict]:
+    """Open fetch failures from the journal, shown as awaiting retry."""
+    items = []
+    for record in read_open_outcomes():
+        if record.get("stage") != "fetch" or record.get("outcome") != "failed":
+            continue
+        items.append(
+            {
+                "channel_id": record.get("channel_id"),
+                "channel_title": record.get("channel_title"),
+                "message_id": record.get("message_id"),
+                "post_url": record.get("post_url"),
+                "stage": record.get("stage"),
+                "category": "retry",
+                "reason": record.get("reason"),
+                "attempts": record.get("attempts"),
+                "first_seen": record.get("first_seen"),
+                "last_seen": record.get("last_seen"),
+            }
+        )
+    return items
+
+
+COLLECTORS.append(collect_fetch_problems)
