@@ -52,10 +52,19 @@ class NormalizedMessageResult:
 
 
 @dataclass
+class NormalizationFailure:
+    """One message normalize_batch could not normalize, with the raised error."""
+
+    message: TelegramMessage
+    error: Exception
+
+
+@dataclass
 class NormalizationBatchResult:
     """Aggregated normalization output and content statistics for a batch."""
 
     texts_with_paths: list[tuple[str, str]] = field(default_factory=list)
+    failures: list[NormalizationFailure] = field(default_factory=list)
     messages_total: int = 0
     messages_with_text: int = 0
     messages_with_images: int = 0
@@ -83,6 +92,7 @@ class NormalizationBatchResult:
     def merge(self, other: "NormalizationBatchResult") -> None:
         """Merge another batch result into this one."""
         self.texts_with_paths.extend(other.texts_with_paths)
+        self.failures.extend(other.failures)
         self.messages_total += other.messages_total
         self.messages_with_text += other.messages_with_text
         self.messages_with_images += other.messages_with_images
@@ -273,7 +283,8 @@ def normalize_batch(messages: list[TelegramMessage]) -> NormalizationBatchResult
     """
     Normalize a batch of messages.
 
-    Returns normalized texts plus aggregate content/outcome statistics.
+    Returns normalized texts, failed messages with their errors, and aggregate
+    content/outcome statistics.
     """
     batch = NormalizationBatchResult()
 
@@ -296,6 +307,7 @@ def normalize_batch(messages: list[TelegramMessage]) -> NormalizationBatchResult
                 batch.skipped_messages += 1
         except Exception as e:
             batch.failed_messages += 1
+            batch.failures.append(NormalizationFailure(message=msg, error=e))
             logger.error(
                 f"  Error normalizing msg {msg.message_id} from '{msg.channel_name}': {e}",
                 exc_info=True,
