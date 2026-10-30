@@ -26,6 +26,8 @@ TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_PHONE = os.getenv("TELEGRAM_PHONE", "")
 TELEGRAM_FOLDER = os.getenv("TELEGRAM_FOLDER", "GeoSpoiler")  # Telegram folder name to read from
+# Optional inclusive cutoff: a UTC date (YYYY-MM-DD) or ISO datetime; fetching stops at the first newer message
+TELEGRAM_FETCH_UNTIL = os.getenv("TELEGRAM_FETCH_UNTIL", "").strip()
 
 # ───────────────────────── LLM ─────────────────────────
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")

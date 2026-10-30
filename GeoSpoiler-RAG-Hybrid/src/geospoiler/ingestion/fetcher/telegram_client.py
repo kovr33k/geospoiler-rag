@@ -11,7 +11,7 @@ Key features:
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -79,6 +79,19 @@ class TelegramMessage:
             return f"https://t.me/{username}/{self.message_id}"
         # Private / no username — use numeric format
         return f"https://t.me/c/{self.channel_id}/{self.message_id}"
+
+
+def _fetch_until() -> datetime | None:
+    """Inclusive fetch cutoff from TELEGRAM_FETCH_UNTIL; a bare date covers the whole UTC day."""
+    value = config.TELEGRAM_FETCH_UNTIL
+    if not value:
+        return None
+    until = datetime.fromisoformat(value)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    if len(value) == 10:
+        until += timedelta(days=1, microseconds=-1)
+    return until
 
 
 class TelegramFetcher:
@@ -185,6 +198,7 @@ class TelegramFetcher:
             f"Fetching from '{channel_name}' (last_id={last_id})..."
         )
 
+        until = _fetch_until()
         raw_messages = []
         async for msg in self.client.iter_messages(
             channel["id"],
@@ -192,6 +206,8 @@ class TelegramFetcher:
             limit=limit,
             reverse=True,  # oldest first for chronological processing
         ):
+            if until and msg.date and msg.date > until:
+                break
             raw_messages.append(msg)
 
         logger.info(f"  Got {len(raw_messages)} new messages from '{channel_name}'.")
