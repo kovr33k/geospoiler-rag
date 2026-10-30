@@ -323,6 +323,9 @@ class EnrichedCardV2(StrictModel):
     ignored_blocks: list[IgnoredBlock] = Field(default_factory=list)
     quality_flags: list[str] = Field(default_factory=list)
     extraction_issues: list[str] = Field(default_factory=list)
+    # source_id of the earlier source with identical content; a copy reuses
+    # its semantic fields and stays out of the search indexes.
+    duplicate_of: str | None = None
 
     @field_validator("content_type")
     @classmethod
@@ -369,6 +372,8 @@ class YouTubeSegmentCardV2(StrictModel):
     search_text: str = ""
     quality_flags: list[str] = Field(default_factory=list)
     extraction_issues: list[str] = Field(default_factory=list)
+    # Episode source_id this segment was copied from; see EnrichedCardV2.duplicate_of.
+    duplicate_of: str | None = None
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> YouTubeSegmentCardV2:

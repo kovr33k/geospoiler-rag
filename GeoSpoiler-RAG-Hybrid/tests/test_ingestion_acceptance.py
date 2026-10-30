@@ -295,6 +295,8 @@ def test_stream_has_bounded_unfinished_inputs(ingestion_runtime, monkeypatch):
 def test_late_success_does_not_hide_early_failure(ingestion_runtime, monkeypatch, stage):
     real_response = llm_backend.complete_json_sync
     original_first = "Foreign input" if stage == "normalization" else RUSSIAN.rstrip(".") + " номер задания 1."
+    # The fake translation returns RUSSIAN; a distinct second post keeps it from being an exact copy.
+    second_text = RUSSIAN.rstrip(".") + " номер задания 2."
 
     def translate(*args, **kwargs):
         raise RuntimeError("controlled normalization failure")
@@ -309,7 +311,7 @@ def test_late_success_does_not_hide_early_failure(ingestion_runtime, monkeypatch
             fault.setattr(llm_backend, "complete_text_sync", translate)
         else:
             fault.setattr(llm_backend, "complete_json_sync", extract)
-        run_messages(monkeypatch, [message(original_first), message(RUSSIAN, 2)])
+        run_messages(monkeypatch, [message(original_first), message(second_text, 2)])
     first = config.ENRICHED_DIR / "Acceptance/1.enriched.json"
     second = config.ENRICHED_DIR / "Acceptance/2.enriched.json"
     assert not first.exists()
@@ -320,7 +322,7 @@ def test_late_success_does_not_hide_early_failure(ingestion_runtime, monkeypatch
         progress = json.loads(enrichment._PROGRESS_FILE.read_text(encoding="utf-8"))
         assert "Acceptance/1" in progress["failed"]
     ingestion_runtime.clear()
-    run_messages(monkeypatch, [message(original_first), message(RUSSIAN, 2)] if stage == "normalization" else [])
+    run_messages(monkeypatch, [message(original_first), message(second_text, 2)] if stage == "normalization" else [])
     assert first.exists()
     assert second.read_bytes() == retained
     assert sum(role == "enrichment" for role, _ in ingestion_runtime) == 1
@@ -765,9 +767,9 @@ def test_explicit_load_adds_updates_reuses_retries_and_preserves_absent_cards(in
     asyncio.run(cli.cmd_load())
     assert len(rag.insertions) == 1 and not rag.deletions
 
-    # Save a second real card without implicitly loading it into the graph.
+    # Save a second real card, distinct from the first, without implicitly loading it into the graph.
     before = len(rag.insertions)
-    run_messages(monkeypatch, [message(RUSSIAN, 2)])
+    run_messages(monkeypatch, [message(RUSSIAN.rstrip(".") + " номер задания 2.", 2)])
     assert len(rag.insertions) == before
     asyncio.run(cli.cmd_load())
     assert len(rag.insertions) == before + 1

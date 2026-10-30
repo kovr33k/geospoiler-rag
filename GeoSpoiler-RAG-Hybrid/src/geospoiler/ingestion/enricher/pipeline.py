@@ -30,6 +30,7 @@ from geospoiler import config
 from geospoiler.contracts.models import EnrichedCardV2, LLMPayload, NormalizedMeta, Provenance, SourceChain
 from geospoiler.ingestion.enricher.chunker import chunk_text, needs_chunking
 from geospoiler.ingestion.enricher.content_classifier import classify_content
+from geospoiler.ingestion.enricher.duplicates import DuplicateRoots, post_content_key
 from geospoiler.ingestion.enricher.graph_text_builder import populate_graph_texts
 from geospoiler.ingestion.enricher.llm_enricher import (
     EmptyLLMResponseError,
@@ -82,12 +83,14 @@ class EnrichmentStats:
     skipped_review: int = 0
     skipped_youtube: int = 0
     repaired: int = 0
+    duplicates: int = 0
     youtube_sources: int = 0
     youtube_episodes: int = 0
     youtube_skipped: int = 0
     youtube_segments: int = 0
     youtube_partial: int = 0
     youtube_failed: int = 0
+    youtube_duplicates: int = 0
     failed: int = 0
     partial_posts: list = field(default_factory=list)
     by_content_type: dict = field(default_factory=dict)
@@ -109,15 +112,21 @@ def enrich_all(
     Returns:
         EnrichmentStats with counts of what happened.
     """
+    global _duplicate_roots
     stats = EnrichmentStats()
     progress = _load_progress()
-    if ready_paths is None:
-        jobs = _collect_enrichment_jobs(
-            progress=progress, channel_filter=channel_filter, force=force, stats=stats,
-        )
-        _run_enrichment_jobs(jobs, progress, stats)
-    else:
-        _run_ready_enrichment(ready_paths, progress, stats, force=force)
+    # A forced run re-extracts every post; copies within the run still reuse it.
+    _duplicate_roots = DuplicateRoots() if force else _load_duplicate_roots()
+    try:
+        if ready_paths is None:
+            jobs = _collect_enrichment_jobs(
+                progress=progress, channel_filter=channel_filter, force=force, stats=stats,
+            )
+            _run_enrichment_jobs(jobs, progress, stats)
+        else:
+            _run_ready_enrichment(ready_paths, progress, stats, force=force)
+    finally:
+        _duplicate_roots = None
     # Persist completed generic work before the potentially long YouTube pass.
     # Otherwise an interrupted YouTube run makes all generic LLM work repeat.
     _save_progress(progress)
@@ -307,6 +316,7 @@ def _add_youtube_stats(stats: EnrichmentStats, youtube_stats) -> None:
     stats.youtube_segments += youtube_stats.segments_written
     stats.youtube_partial += youtube_stats.partial_sources
     stats.youtube_failed += youtube_stats.failed_sources
+    stats.youtube_duplicates += youtube_stats.duplicate_episodes
 
 
 def _is_youtube_only_normalized_document(meta: NormalizedMeta, text_path: Path) -> bool:
@@ -397,6 +407,29 @@ def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | N
         )
         return None
 
+    roots = _duplicate_roots
+    key = post_content_key(meta, normalized_text) if roots is not None else None
+    if key is None:
+        return _extract_card(job, stats, meta, normalized_text, content_type)
+    source_id = _build_source_id(meta, job.channel_name, job.msg_id)
+    with roots.lock(key):
+        root = roots.get(key)
+        if root is not None and root["provenance"]["source_id"] != source_id:
+            return _duplicate_card(job, meta, normalized_text, content_type, root)
+        card_data = _extract_card(job, stats, meta, normalized_text, content_type)
+        if _is_reusable_root(card_data):
+            roots.set(key, card_data)
+        return card_data
+
+
+def _extract_card(
+    job: _EnrichmentJob,
+    stats: EnrichmentStats,
+    meta: NormalizedMeta,
+    normalized_text: str,
+    content_type: str,
+) -> dict:
+    """LLM extraction, validation and repair of one post into card data."""
     # 3. Preprocess
     preprocessed = preprocess(normalized_text)
 
@@ -477,6 +510,38 @@ def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | N
     if repair_succeeded and threading.current_thread() is threading.main_thread():
         stats.repaired += 1
         card_data["_repair_counted"] = True
+    return card_data
+
+
+def _is_reusable_root(card_data: dict) -> bool:
+    """Whether copies of this post may take this card instead of their own extraction."""
+    return bool(
+        (card_data.get("summary") or card_data.get("key_points"))
+        and "extraction_unstable" not in card_data.get("quality_flags", [])
+    )
+
+
+def _duplicate_card(
+    job: _EnrichmentJob,
+    meta: NormalizedMeta,
+    normalized_text: str,
+    content_type: str,
+    root: dict,
+) -> dict:
+    """Card of an exact copy: the root's semantic fields with this post's provenance."""
+    payload = LLMPayload.model_validate({name: root[name] for name in LLMPayload.model_fields if name in root})
+    card = _assemble_card(
+        payload=payload,
+        meta=meta,
+        content_type=content_type,
+        channel_name=job.channel_name,
+        msg_id=job.msg_id,
+        txt_path=job.txt_path,
+        preprocessed=preprocess(normalized_text),
+        extraction_issues=list(root.get("extraction_issues") or []),
+    )
+    card_data = card.model_copy(update={"duplicate_of": root["provenance"]["source_id"]}).model_dump(mode="json")
+    card_data["_duplicate"] = True
     return card_data
 
 
@@ -700,6 +765,8 @@ def _handle_enrichment_result(
     card = result
     if card.pop("_repair_succeeded", False) and not card.pop("_repair_counted", False):
         stats.repaired += 1
+    if card.pop("_duplicate", False):
+        stats.duplicates += 1
     ct = card.get("content_type", "unknown")
 
     is_partial = (
@@ -713,14 +780,8 @@ def _handle_enrichment_result(
         stats.partial_posts.append(job.progress_key)
         logger.warning(f"  Partial: {job.progress_key} -> {ct}")
     else:
-        out_dir = job.out_path.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        temporary = job.out_path.with_name(f".{job.out_path.name}.tmp")
-        temporary.write_text(
-            json.dumps(card, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(job.out_path)
+        job.out_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_card(job.out_path, card)
 
         failed = progress.get("failed")
         if not isinstance(failed, dict):
@@ -924,6 +985,56 @@ def _queue_uninformative_review(
         reason=triage_reason,
         normalized_filepath=str(txt_path),
     )
+
+
+# ── Exact duplicates ───────────────────────────────────────────────────────
+
+# Set by enrich_all for the duration of a run; None disables reuse.
+_duplicate_roots: DuplicateRoots | None = None
+
+
+def _load_duplicate_roots() -> DuplicateRoots:
+    """Index current post cards by content key and mark the copies among them.
+
+    The earliest current card of a key that is not a copy of another one is
+    the root; every other card of the key gets duplicate_of. A mark that no
+    longer matches is rewritten or cleared, so a changed root never hides the
+    posts that used to copy it.
+    """
+    groups: dict[str, list[tuple[Path, EnrichedCardV2]]] = {}
+    for txt_path in sorted(config.NORMALIZED_DIR.glob("*/*.txt")):
+        channel_name, msg_id = txt_path.parent.name, txt_path.stem
+        card_path = config.ENRICHED_DIR / channel_name / f"{msg_id}.enriched.json"
+        if not card_path.is_file() or not txt_path.with_suffix(".meta.json").is_file():
+            continue
+        try:
+            meta = read_normalized_meta(txt_path, recover=False)
+            key = post_content_key(meta, txt_path.read_text(encoding="utf-8"))
+            source_id = _build_source_id(meta, channel_name, msg_id)
+            if key is None or not _is_valid_enriched_output(card_path, source_id):
+                continue
+            card = EnrichedCardV2.model_validate_json(card_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        groups.setdefault(key, []).append((card_path, card))
+
+    roots: dict[str, dict] = {}
+    for key, members in groups.items():
+        member_ids = {card.provenance.source_id for _, card in members}
+        candidates = [member for member in members if member[1].duplicate_of not in member_ids]
+        _, root = min(candidates or members, key=lambda member: (member[1].provenance.date or "", member[1].provenance.source_id))
+        for card_path, card in members:
+            expected = None if card is root else root.provenance.source_id
+            if card.duplicate_of != expected:
+                _write_card(card_path, card.model_copy(update={"duplicate_of": expected}).model_dump(mode="json"))
+        roots[key] = root.model_copy(update={"duplicate_of": None}).model_dump(mode="json")
+    return DuplicateRoots(roots)
+
+
+def _write_card(path: Path, card: dict) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 # ── Progress tracking ──────────────────────────────────────────────────────

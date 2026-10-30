@@ -31,6 +31,7 @@ from geospoiler.ingestion.normalizer.transcription_handler import TranscriptionR
 from geospoiler.ingestion.normalizer.translator import translate_to_russian_if_needed
 from geospoiler.ingestion.normalizer.youtube_handler import (
     extract_youtube_artifact,
+    reuse_youtube_artifact,
     save_youtube_artifact,
 )
 from geospoiler.providers import llm_backend
@@ -160,7 +161,7 @@ def normalize_message(
     # post keeps its own text in the normal archive and gets a separate episode.
     for url in classified.youtube_urls:
         try:
-            artifact = extract_youtube_artifact(url)
+            artifact = reuse_youtube_artifact(url) or extract_youtube_artifact(url)
             paths = save_youtube_artifact(
                 artifact,
                 channel_name=msg.channel_name,

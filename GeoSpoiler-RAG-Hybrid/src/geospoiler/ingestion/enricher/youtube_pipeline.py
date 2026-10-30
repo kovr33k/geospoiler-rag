@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -67,6 +68,9 @@ _PIPELINE_OWNED_QUALITY_FLAGS = frozenset(
         "timestamps_unavailable",
     }
 )
+# One worker per video at a time, so a copy waits for the first generation.
+_video_locks: dict[str, threading.Lock] = {}
+_video_locks_guard = threading.Lock()
 
 
 @dataclass
@@ -77,6 +81,7 @@ class YouTubeEnrichmentStats:
     segments_written: int = 0
     partial_sources: int = 0
     failed_sources: int = 0
+    duplicate_episodes: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,7 @@ class YouTubeEnrichmentResult:
     segments_written: int = 0
     partial_failure: bool = False
     review_required: bool = False
+    duplicate: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,6 +154,8 @@ def _enrich_youtube_sources(sources, *, force: bool, discovery_errors) -> YouTub
             stats.segments_written += result.segments_written
             if result.partial_failure:
                 stats.partial_sources += 1
+            if result.duplicate:
+                stats.duplicate_episodes += 1
             if result.review_required:
                 _queue_youtube_failure(source, "partial or unstable extraction")
         except Exception as exc:
@@ -162,28 +170,44 @@ def _enrich_youtube_sources(sources, *, force: bool, discovery_errors) -> YouTub
 
 
 def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
+    video_id = str(source.get("video_id") or "")
+    with _video_locks_guard:
+        lock = _video_locks.setdefault(video_id, threading.Lock())
+    with lock:
+        # A forced run re-extracts every video, so it never copies a generation.
+        root = None if force else _video_root(source)
+        if root is not None and _segmentation_inputs(source) != _segmentation_inputs(root[0]):
+            source = _adopt_root_transcript(source, root[0])
+        return _enrich_video_source(source, force=force, root=root)
+
+
+def _enrich_video_source(
+    source: dict,
+    *,
+    force: bool,
+    root: tuple[dict, EnrichedCardV2] | None = None,
+) -> YouTubeEnrichmentResult:
     transcript = str(source.get("transcript_text") or "").strip()
     if not transcript or source.get("transcript_source") in {"description", "unavailable"}:
         raise ValueError("YouTube transcript is unavailable")
 
     card_path = _episode_card_path(source)
-    duration = _number(source.get("duration_seconds"))
-    long_form = needs_youtube_segments(transcript, duration)
-    specs = build_segment_specs(
-        transcript,
-        cues=source.get("cues") or [],
-        chapters=source.get("chapters") or [],
-    ) if long_form else []
+    long_form, specs = _segment_plan(source, transcript)
 
     fingerprint = _source_fingerprint(source, transcript)
     checkpoint_fingerprint = _checkpoint_fingerprint(fingerprint)
-    if not force and _is_current(card_path, source, fingerprint, specs):
+    if not force and _is_current(card_path, source, fingerprint, specs) and (
+        root is None or _published_duplicate_of(card_path) == root[1].provenance.source_id
+    ):
         _cleanup_checkpoint_family(source, keep_fingerprint=None)
         return YouTubeEnrichmentResult(
             written=False,
             skipped=True,
             segments_written=0,
         )
+
+    if root is not None:
+        return _publish_duplicate(source, *root, card_path, specs, fingerprint, long_form)
 
     if specs:
         _initialize_checkpoint(source, checkpoint_fingerprint, specs)
@@ -212,6 +236,10 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
             # without semantic fields and is retried on the next run.
             if issues or "extraction_unstable" in payload.quality_flags:
                 partial_failure = True
+                logger.warning(
+                    "YouTube segment %s of %s failed for %s: %s",
+                    spec.index, len(specs), source.get("video_id") or source.get("url"), "; ".join(issues)[:500],
+                )
             segment_cards.append(_build_segment_card(source, spec, payload, issues))
             if not issues and "extraction_unstable" not in payload.quality_flags:
                 successful_card = segment_cards[-1]
@@ -236,10 +264,6 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
                 logger.warning(
                     "YouTube episode extraction was empty; using deterministic segment fallback for %s",
                     source.get("video_id") or source.get("url"),
-                logger.warning(
-                    "YouTube segment %s of %s failed for %s: %s",
-                    spec.index, len(specs), source.get("video_id") or source.get("url"), "; ".join(issues)[:500],
-                )
                 )
                 payload, issues = fallback, []
         if not payload.summary.strip() and not payload.key_points:
@@ -274,6 +298,131 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
         segments_written=len(segment_cards),
         partial_failure=partial_failure,
         review_required=partial_failure or "extraction_unstable" in card.quality_flags,
+    )
+
+
+def _segment_plan(source: dict, transcript: str) -> tuple[bool, list[SegmentSpec]]:
+    long_form = needs_youtube_segments(transcript, _number(source.get("duration_seconds")))
+    specs = build_segment_specs(
+        transcript,
+        cues=source.get("cues") or [],
+        chapters=source.get("chapters") or [],
+    ) if long_form else []
+    return long_form, specs
+
+
+def _segmentation_inputs(source: dict) -> tuple:
+    return (
+        str(source.get("transcript_text") or "").strip(),
+        source.get("cues") or [],
+        source.get("chapters") or [],
+        source.get("duration_seconds"),
+    )
+
+
+def _video_root(source: dict) -> tuple[dict, EnrichedCardV2] | None:
+    """The root generation of this video when another post holds it.
+
+    Every post of one video is a copy of the earliest post whose current
+    generation is not itself a copy. None when this post is that root, when no
+    current generation exists yet, or for a legacy source without an artifact.
+    """
+    normalized_root = config.YOUTUBE_NORMALIZED_DIR
+    if not source.get("metadata_path") or not normalized_root.exists():
+        return None
+    metadata_paths = sorted(normalized_root.rglob(f"{_safe_component(source.get('video_id'))}.youtube.meta.json"))
+    roots = []
+    for other in _iter_dedicated_sources(None, metadata_paths=metadata_paths):
+        if other["video_id"] != source.get("video_id"):
+            continue
+        card = _current_episode_card(other)
+        if card is not None and card.duplicate_of is None:
+            roots.append((other, card))
+    if not roots:
+        return None
+    root = min(roots, key=lambda item: (str(item[0].get("telegram_date") or ""), item[1].provenance.source_id))
+    return None if _source_key(root[0]) == _source_key(source) else root
+
+
+def _current_episode_card(source: dict) -> EnrichedCardV2 | None:
+    transcript = str(source.get("transcript_text") or "").strip()
+    _, specs = _segment_plan(source, transcript)
+    card_path = _episode_card_path(source)
+    if not _is_current(card_path, source, _source_fingerprint(source, transcript), specs):
+        return None
+    try:
+        return EnrichedCardV2.model_validate_json(card_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValidationError):
+        return None
+
+
+def _published_duplicate_of(card_path: Path) -> str | None:
+    try:
+        return EnrichedCardV2.model_validate_json(card_path.read_text(encoding="utf-8")).duplicate_of
+    except (OSError, UnicodeError, ValidationError):
+        return None
+
+
+def _adopt_root_transcript(source: dict, root: dict) -> dict:
+    """Save the root's transcript for this post, so the copy's segments match the root's.
+
+    Two downloads of one video may differ slightly (subtitles, Whisper runs).
+    The post's own transcript files stay on disk; its metadata stops naming them.
+    """
+    metadata_path = Path(source["metadata_path"])
+    own = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = json.loads(Path(root["metadata_path"]).read_text(encoding="utf-8"))
+    for key in ("transcript_path", "cues_path"):
+        if metadata.get(key):
+            target = metadata_path.parent / Path(metadata[key]).name
+            shutil.copyfile(config.resolve_project_path(metadata[key]), target)
+            metadata[key] = str(target.relative_to(config.PROJECT_ROOT))
+    metadata["telegram_source"] = own.get("telegram_source")
+    temporary = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(metadata_path)
+    logger.info("YouTube %s now uses the transcript of %s", _episode_source_id(source), _episode_source_id(root))
+    adopted = next(_iter_dedicated_sources(None, metadata_paths=[metadata_path]), None)
+    if adopted is None:
+        raise ValueError("YouTube artifact is invalid after adopting the root transcript")
+    return adopted
+
+
+def _publish_duplicate(
+    source: dict,
+    donor: dict,
+    donor_card: EnrichedCardV2,
+    card_path: Path,
+    specs: list[SegmentSpec],
+    fingerprint: str,
+    long_form: bool,
+) -> YouTubeEnrichmentResult:
+    """Publish the donor's episode and segments under this post without LLM calls."""
+    root_id = donor_card.duplicate_of or donor_card.provenance.source_id
+    segment_cards: list[YouTubeSegmentCardV2] = []
+    for spec in specs:
+        segment_path = _segment_dir(donor) / f"{spec.index:04d}.youtube-segment.json"
+        donor_segment = YouTubeSegmentCardV2.model_validate_json(segment_path.read_text(encoding="utf-8"))
+        payload = _segment_card_payload(donor_segment, spec)
+        payload.pop("char_range")
+        segment_cards.append(_build_segment_card(
+            source, spec, LLMPayload.model_validate(payload), list(donor_segment.extraction_issues),
+            duplicate_of=root_id,
+        ))
+    dumped = donor_card.model_dump(mode="json")
+    payload = LLMPayload.model_validate({
+        **{name: dumped[name] for name in _payload_fields()},
+        "quality_flags": _without_pipeline_owned_quality_flags(donor_card.quality_flags),
+    })
+    card = _build_episode_card(source, payload, list(donor_card.extraction_issues), duplicate_of=root_id)
+    _publish_generation(source, card_path, card, segment_cards, fingerprint, long_form)
+    _cleanup_checkpoint_family(source, keep_fingerprint=None)
+    logger.info("YouTube %s is a copy of %s; reused its generation", _episode_source_id(source), root_id)
+    return YouTubeEnrichmentResult(
+        written=True,
+        skipped=False,
+        segments_written=len(segment_cards),
+        duplicate=True,
     )
 
 
@@ -391,6 +540,7 @@ def _compact_merge_episode_payload(
         next_level: list[dict] = []
         for batch in _merge_batches(current, _COMPACT_MERGE_BATCH_CHARS):
             if len(batch) == 1:
+                # Compact items omit retrieval fields; those are restored below.
                 merged = LLMPayload.model_validate(
                     {key: batch[0][key] for key in _payload_fields() if key in batch[0]}
                 )
@@ -540,7 +690,6 @@ def _finish_payload(raw: object, source_text: str) -> tuple[LLMPayload, list[str
         final_validation = validate_payload(payload, source_text)
         if not final_validation.is_valid and drop_invalid_optional_items(payload, final_validation):
             final_validation = validate_payload(payload, source_text)
-                # Compact items omit retrieval fields; those are restored below.
             if final_validation.is_valid:
                 return payload, []
         if not final_validation.is_valid:
@@ -555,6 +704,8 @@ def _build_segment_card(
     spec: SegmentSpec,
     payload: LLMPayload,
     issues: list[str],
+    *,
+    duplicate_of: str | None = None,
 ) -> YouTubeSegmentCardV2:
     parent_id = _episode_source_id(source)
     start = spec.start_seconds
@@ -587,6 +738,7 @@ def _build_segment_card(
         search_text=_build_segment_search_text(payload, spec.text),
         quality_flags=list(dict.fromkeys(flags)),
         extraction_issues=issues,
+        duplicate_of=duplicate_of,
     )
 
 
@@ -594,6 +746,8 @@ def _build_episode_card(
     source: dict,
     payload: LLMPayload,
     issues: list[str],
+    *,
+    duplicate_of: str | None = None,
 ) -> EnrichedCardV2:
     flags = list(payload.quality_flags)
     if not source.get("cues") and "timestamps_unavailable" not in flags:
@@ -638,6 +792,7 @@ def _build_episode_card(
         ignored_blocks=[],
         quality_flags=list(dict.fromkeys(flags)),
         extraction_issues=issues,
+        duplicate_of=duplicate_of,
     ).model_dump(mode="json")
     populate_graph_texts(card_data)
     return EnrichedCardV2.model_validate(card_data)
@@ -815,6 +970,7 @@ def _source_from_metadata(
         "cues": cues,
         "chapters": metadata.get("chapters") or [],
         "text_path": str(text_path),
+        "metadata_path": str(artifact.metadata_path),
         "message_id": telegram.get("message_id") or metadata.get("video_id"),
         "telegram_channel": str(telegram.get("channel_name") or ""),
         "telegram_channel_id": telegram.get("channel_id"),

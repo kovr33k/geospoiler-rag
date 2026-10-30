@@ -117,7 +117,7 @@ def search(query: str, top_k: int | None = 10) -> list[ShadowMatch]:
             for card_path in sorted(channel_dir.glob("*.enriched.json"), key=lambda path: path.as_posix()):
                 try:
                     card = json.loads(card_path.read_text(encoding="utf-8"))
-                    if not isinstance(card, dict) or card.get("schema_version") != "enriched_v2":
+                    if not isinstance(card, dict) or card.get("schema_version") != "enriched_v2" or card.get("duplicate_of"):
                         continue
 
                     search_text = card_search_text(card, card_path)

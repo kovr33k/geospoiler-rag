@@ -617,6 +617,9 @@ async def load_from_enriched(
         if {"extraction_unstable", "partial_segment_failure"} & set(quality_flags):
             logger.info("Skipping unstable enriched card from LightRAG: %s", card_path)
             continue
+        if card.get("duplicate_of"):
+            logger.info("Skipping duplicate enriched card from LightRAG: %s", card_path)
+            continue
 
         graph_text = (card.get("graph_text") or "").strip()
         if not graph_text:
