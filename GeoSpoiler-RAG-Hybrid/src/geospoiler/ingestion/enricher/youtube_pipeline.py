@@ -191,7 +191,6 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
     segment_payloads: list[dict] = []
     segment_cards: list[YouTubeSegmentCardV2] = []
     partial_failure = False
-    language_failure = False
     if specs:
         for spec in specs:
             cached_segment = _load_reusable_segment(
@@ -209,8 +208,8 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
             except Exception as exc:
                 payload = LLMPayload(quality_flags=["extraction_unstable"])
                 issues = [f"segment_{spec.index}_extraction_failed: {exc}"]
-            if has_required_language_violations(issues):
-                language_failure = True
+            # A failed segment, including a persistent language breach, publishes
+            # without semantic fields and is retried on the next run.
             if issues or "extraction_unstable" in payload.quality_flags:
                 partial_failure = True
             segment_cards.append(_build_segment_card(source, spec, payload, issues))
@@ -237,6 +236,10 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
                 logger.warning(
                     "YouTube episode extraction was empty; using deterministic segment fallback for %s",
                     source.get("video_id") or source.get("url"),
+                logger.warning(
+                    "YouTube segment %s of %s failed for %s: %s",
+                    spec.index, len(specs), source.get("video_id") or source.get("url"), "; ".join(issues)[:500],
+                )
                 )
                 payload, issues = fallback, []
         if not payload.summary.strip() and not payload.key_points:
@@ -245,8 +248,6 @@ def _enrich_source(source: dict, *, force: bool) -> YouTubeEnrichmentResult:
             )
 
     if has_required_language_violations(issues):
-        language_failure = True
-    if language_failure:
         raise ValueError(
             "YouTube extraction still violates the Russian-language contract after repair"
         )
@@ -391,7 +392,7 @@ def _compact_merge_episode_payload(
         for batch in _merge_batches(current, _COMPACT_MERGE_BATCH_CHARS):
             if len(batch) == 1:
                 merged = LLMPayload.model_validate(
-                    {key: batch[0].get(key) for key in _payload_fields()}
+                    {key: batch[0][key] for key in _payload_fields() if key in batch[0]}
                 )
                 _normalize_quality_flags(merged)
                 batch_issues: list[str] = []
@@ -539,6 +540,7 @@ def _finish_payload(raw: object, source_text: str) -> tuple[LLMPayload, list[str
         final_validation = validate_payload(payload, source_text)
         if not final_validation.is_valid and drop_invalid_optional_items(payload, final_validation):
             final_validation = validate_payload(payload, source_text)
+                # Compact items omit retrieval fields; those are restored below.
             if final_validation.is_valid:
                 return payload, []
         if not final_validation.is_valid:
