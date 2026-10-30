@@ -80,6 +80,29 @@ normalized text + .meta.json
 - `quality_flags` — data quality signals (list of strings)
 - `extraction_issues` — validator diagnostics retained when a repair could not
   remove a contract violation; excluded from graph and search text
+- `duplicate_of` — `source_id` of the root card when this source is an exact
+  copy, otherwise `null`; see Exact Duplicates below
+
+## Exact Duplicates
+
+An exact copy is the same Telegram post published again (same caption,
+attachment ids and links; the channel header is ignored) or the same YouTube
+video (same `video_id`) linked from another post. Enrichment gives the copy the
+root card's semantic fields without an LLM call, keeps the copy's own
+`provenance` and sets `duplicate_of`. A copied YouTube episode and its
+`youtube_segment_v2` segments carry `duplicate_of` too.
+
+Normalization reuses the saved transcript of a video already extracted for
+another post. A video post normalized before that, whose transcript differs
+from the root's, takes over the root's transcript files during enrichment; its
+own files stay on disk unreferenced. The root of a video is the earliest post
+whose current generation is not a copy.
+
+Card FTS, YouTube segment FTS, shadow search and `load` skip cards with
+`duplicate_of`; the source registry keeps every source. Each normal `enrich`
+run marks copies among current post cards and clears a mark whose root no
+longer matches. A forced run (`--force`) re-extracts every source; post copies
+inside that run still reuse their root, YouTube copies do not.
 
 ## Removed from v2 (no longer exist)
 

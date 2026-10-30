@@ -297,6 +297,9 @@ def iter_card_records(enriched_dir: Path = config.ENRICHED_DIR) -> Iterable[Card
         except (json.JSONDecodeError, OSError) as exc:
             logger.debug("Card FTS could not read %s: %s", card_path, exc)
             continue
+        if card.get("duplicate_of"):
+            # The root card of the same content is indexed instead.
+            continue
         record = card_to_fts_record(card, card_path)
         if record:
             yield record
@@ -313,7 +316,7 @@ def iter_youtube_segment_records(
                 json.loads(card_path.read_text(encoding="utf-8"))
             )
             search_text = segment.search_text.strip()
-            if not search_text:
+            if not search_text or segment.duplicate_of:
                 continue
             yield (
                 segment.segment_id,

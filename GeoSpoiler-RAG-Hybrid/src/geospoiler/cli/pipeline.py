@@ -605,6 +605,8 @@ def _print_enrich_summary(stats: EnrichmentStats) -> None:
     print("═" * 60)
     print(f"Просканировано постов: {stats.scanned}")
     print(f"Обогащено полностью: {stats.enriched}")
+    if getattr(stats, "duplicates", 0):
+        print(f"Из них явных дублей (без Luna): {stats.duplicates}")
     if stats.partial:
         print(f"⚠️  Частично (LLM не ответил, будет повтор): {stats.partial}")
     if hasattr(stats, "skipped_review") and stats.skipped_review:
@@ -618,6 +620,8 @@ def _print_enrich_summary(stats: EnrichmentStats) -> None:
         )
         if getattr(stats, "youtube_skipped", 0):
             print(f"YouTube skipped (already current): {stats.youtube_skipped}")
+        if getattr(stats, "youtube_duplicates", 0):
+            print(f"YouTube явных дублей (без Luna): {stats.youtube_duplicates}")
         if stats.youtube_partial:
             print(f"⚠️  YouTube с частичными сегментами: {stats.youtube_partial}")
         if stats.youtube_failed:

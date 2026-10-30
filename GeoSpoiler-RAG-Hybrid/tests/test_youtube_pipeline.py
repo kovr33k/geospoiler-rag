@@ -405,6 +405,27 @@ class YouTubePipelineTests(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertNotIn("extraction_unstable", payload.quality_flags)
 
+    def test_compact_merge_keeps_odd_singleton_batch_valid(self):
+        source = {
+            "video_id": "abc",
+            "url": "https://www.youtube.com/watch?v=abc",
+            "title": "Test video",
+        }
+        # Large summaries force pairs per merge batch, leaving the 7th segment alone.
+        segment_payloads = [_payload(f"Сегмент {index}. " + "Китай обсуждал поставки. " * 400) for index in range(7)]
+        merged = (LLMPayload.model_validate(_payload("Итог эпизода.")), [])
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(config, "ENRICHED_DIR", Path(tmpdir)), \
+             patch("enricher.youtube_pipeline.merge_chunk_results_raw", return_value={}), \
+             patch("enricher.youtube_pipeline._finish_payload", return_value=merged):
+            payload, issues = _merge_episode_payload(source, "Содержательный transcript", segment_payloads)
+
+        self.assertEqual(issues, [])
+        self.assertEqual(payload.summary, "Итог эпизода.")
+        self.assertEqual([item.text for item in payload.entities.countries], ["Китай"])
+        self.assertTrue(payload.search_phrases)
+
     def test_partial_generation_does_not_reuse_segment_with_wrong_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -884,6 +905,59 @@ class YouTubePipelineTests(unittest.TestCase):
             self.assertEqual(first.partial_sources, 1)
             self.assertEqual(second.partial_sources, 0)
             self.assertEqual(calls, calls_after_first + 1)
+
+    def test_segment_language_failure_publishes_partial_episode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            normalized = root / "normalized_youtube" / "Channel" / "10"
+            enriched = root / "enriched"
+            segments = root / "enriched_segments"
+            normalized.mkdir(parents=True)
+            text_path = normalized / "abc.youtube.txt"
+            text_path.write_text("Китай обсуждал поставки компонентов. " * 700, encoding="utf-8")
+            cues_path = normalized / "abc.youtube.cues.json"
+            cues_path.write_text("[]", encoding="utf-8")
+            (normalized / "abc.youtube.meta.json").write_text(
+                json.dumps({
+                    "url": "https://www.youtube.com/watch?v=abc123",
+                    "video_id": "abc123",
+                    "title": "Test video",
+                    "channel": "Test channel",
+                    "duration_seconds": 1800,
+                    "language": "uk",
+                    "transcript_source": "whisper",
+                    "transcript_path": str(text_path.relative_to(root)),
+                    "cues_path": str(cues_path.relative_to(root)),
+                    "telegram_source": {"channel_name": "Channel", "channel_id": 1, "message_id": 10},
+                }),
+                encoding="utf-8",
+            )
+            ukrainian = _payload("Україна ухвалила важливе рішення.")
+            calls = 0
+
+            def extract_segment(*_args):
+                nonlocal calls
+                calls += 1
+                return ukrainian if calls == 1 else _payload()
+
+            with patch.object(config, "PROJECT_ROOT", root), \
+                 patch.object(config, "YOUTUBE_NORMALIZED_DIR", root / "normalized_youtube"), \
+                 patch.object(config, "NORMALIZED_DIR", root / "normalized"), \
+                 patch.object(config, "ENRICHED_DIR", enriched), \
+                 patch.object(config, "YOUTUBE_SEGMENTS_DIR", segments), \
+                 patch.object(config, "YOUTUBE_CHECKPOINT_DIR", root / "checkpoints"), \
+                 patch.object(config, "REVIEW_QUEUE_DIR", root / "review_queue"), \
+                 patch("enricher.repair._call_llm", return_value=ukrainian), \
+                 patch("enricher.youtube_pipeline.extract_chunk_raw", side_effect=extract_segment), \
+                 patch("enricher.youtube_pipeline.merge_chunk_results_raw", return_value=_payload()):
+                stats = enrich_youtube_all(force=True)
+
+            self.assertEqual(stats.failed_sources, 0)
+            self.assertEqual(stats.episodes_written, 1)
+            self.assertEqual(stats.partial_sources, 1)
+            episode = json.loads(next(enriched.rglob("*.enriched.json")).read_text(encoding="utf-8"))
+            self.assertIn("partial_segment_failure", episode["quality_flags"])
+            self.assertNotRegex(episode["summary"], "[іїєґ]")
 
     def test_interrupted_run_resumes_from_checkpointed_segments(self):
         with tempfile.TemporaryDirectory() as tmpdir:

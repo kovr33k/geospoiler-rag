@@ -196,6 +196,51 @@ def extract_youtube_artifact(url: str) -> YouTubeArtifact:
     )
 
 
+def reuse_youtube_artifact(url: str) -> YouTubeArtifact | None:
+    """The transcript of the same video saved for another post, if any.
+
+    Reusing it skips a new download and Whisper run and gives every post of the
+    video the same transcript, so enrichment can copy the first generation.
+    """
+    url = validate_youtube_url(url)
+    video_id = _video_id_from_url(url)
+    root = config.YOUTUBE_NORMALIZED_DIR
+    if video_id == "unknown" or not root.exists():
+        return None
+    for metadata_path in sorted(root.rglob(f"{_safe_component(video_id)}.youtube.meta.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if (
+                metadata.get("video_id") != video_id
+                or not metadata.get("has_transcript")
+                or metadata.get("transcript_source") in {"description", "unavailable"}
+            ):
+                continue
+            text = config.resolve_project_path(metadata["transcript_path"]).read_text(encoding="utf-8")
+            cues = json.loads(config.resolve_project_path(metadata["cues_path"]).read_text(encoding="utf-8"))
+            _header, _, transcript_text = text.partition("\n\n")
+            if not transcript_text.strip():
+                continue
+            return YouTubeArtifact(
+                url=url,
+                video_id=video_id,
+                title=str(metadata.get("title") or ""),
+                channel=str(metadata.get("channel") or ""),
+                duration_seconds=_as_float(metadata.get("duration_seconds")),
+                language=str(metadata.get("language") or "unknown"),
+                transcript_source=str(metadata["transcript_source"]),
+                transcript_text=transcript_text.strip(),
+                cues=[YouTubeCue(**cue) for cue in cues],
+                description=str(metadata.get("description") or ""),
+                chapters=list(metadata.get("chapters") or []),
+                description_links=list(metadata.get("description_links") or []),
+                extracted_at=str(metadata.get("extracted_at") or ""),
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("Cannot reuse YouTube artifact %s: %s", metadata_path, exc)
+    return None
+
+
 def save_youtube_artifact(
     artifact: YouTubeArtifact,
     *,

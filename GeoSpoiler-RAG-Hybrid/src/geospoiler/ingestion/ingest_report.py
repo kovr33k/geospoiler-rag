@@ -210,6 +210,49 @@ def collect_review_queue_problems() -> list[dict]:
     return items
 
 
+def _telegram_side(card: dict) -> dict:
+    """Telegram channel title and post link of a card; a video names its post in source_chain."""
+    provenance = card.get("provenance") if isinstance(card.get("provenance"), dict) else {}
+    if card.get("content_type") != "youtube_transcript":
+        return {"channel_title": provenance.get("channel"), "post_url": provenance.get("post_url")}
+    links = (card.get("source_chain") or {}).get("external_links") or []
+    post_url = next((link.get("url") for link in links if link.get("label") == "Telegram post"), None)
+    channel_title = None
+    if provenance.get("normalized_path"):
+        meta_dir = config.resolve_project_path(provenance["normalized_path"]).parent
+        for meta_path in sorted(meta_dir.glob("*.youtube.meta.json")):
+            channel_title = (_read_json_object(meta_path).get("telegram_source") or {}).get("channel_name")
+    return {"channel_title": channel_title, "post_url": post_url}
+
+
+def collect_exact_duplicates() -> list[dict]:
+    """Sources kept as exact copies of another source. They are not problems."""
+    if not config.ENRICHED_DIR.is_dir():
+        return []
+    cards = {}
+    for card_path in sorted(config.ENRICHED_DIR.rglob("*.enriched.json")):
+        card = _read_json_object(card_path)
+        source_id = (card.get("provenance") or {}).get("source_id")
+        if source_id:
+            cards[source_id] = card
+    items = []
+    for source_id, card in cards.items():
+        root_id = card.get("duplicate_of")
+        if not root_id:
+            continue
+        root = _telegram_side(cards.get(root_id, {}))
+        items.append({
+            "kind": "video" if card.get("content_type") == "youtube_transcript" else "post",
+            "source_id": source_id,
+            **_telegram_side(card),
+            "duplicate_of": root_id,
+            "root_channel_title": root["channel_title"],
+            "root_post_url": root["post_url"],
+        })
+    items.sort(key=lambda item: (item["channel_title"] or "", item["source_id"]))
+    return items
+
+
 def combine_problem_items(items: list[dict]) -> list[dict]:
     """Keep one item per channel and message, preferring the higher-priority label."""
     chosen: dict[tuple, dict] = {}
@@ -252,11 +295,24 @@ def build_ingest_report(*, channel: str | None = None, category: str | None = No
     items.sort(key=lambda item: (
         item["channel_title"] or "", item["channel_id"] or 0, item["message_id"] is None, item["message_id"] or 0,
     ))
+    # Copies are not outcomes, so a category filter leaves them out.
+    duplicates = [] if category is not None else collect_exact_duplicates()
+    if channel is not None:
+        duplicates = [item for item in duplicates if item["channel_title"] == channel]
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "summary": _summary(items),
         "items": items,
+        "duplicates": duplicates,
     }
+
+
+def _duplicates_line(duplicates: list[dict]) -> str:
+    videos = sum(item["kind"] == "video" for item in duplicates)
+    return (
+        f"явных дублей: {len(duplicates)} (постов {len(duplicates) - videos}, видео {videos}); "
+        "в поиске не участвуют, Luna на них не тратилась"
+    )
 
 
 def render_ingest_report(report: dict) -> str:
@@ -291,6 +347,17 @@ def render_ingest_report(report: dict) -> str:
     lines.append(f"ошибка обработки: {by_category['failed']}")
     lines.append(f"пропуск по политике: {by_category['policy']}")
     lines.append(f"всего: {report['summary']['total']}")
+    duplicates = report.get("duplicates") or []
+    if duplicates:
+        lines.append("")
+        lines.append("Явные дубли")
+        for item in duplicates:
+            kind = " (видео)" if item["kind"] == "video" else ""
+            lines.append(
+                f"  {item['channel_title'] or '?'} {item['post_url'] or item['source_id']}{kind}"
+                f" — копия: {item['root_channel_title'] or '?'} {item['root_post_url'] or item['duplicate_of']}"
+            )
+        lines.append(_duplicates_line(duplicates))
     return "\n".join(lines)
 
 
@@ -311,8 +378,11 @@ def cmd_ingest_report(
 def print_problem_posts_line() -> None:
     """One read-only line at the end of run. A report failure must not fail the run."""
     try:
-        total = build_ingest_report()["summary"]["total"]
-        print(f"Проблемных постов: {total}. Подробности: python main.py ingest-report")
+        report = build_ingest_report()
+        print(f"Проблемных постов: {report['summary']['total']}. Подробности: python main.py ingest-report")
+        if report["duplicates"]:
+            line = _duplicates_line(report["duplicates"])
+            print(line[0].upper() + line[1:])
     except Exception:
         logger.exception("Could not build ingest report")
 

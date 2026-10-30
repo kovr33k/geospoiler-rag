@@ -96,6 +96,19 @@ class LlmBackendTests(unittest.TestCase):
         self.assertIn("read-only", command)
         self.assertIn("--output-schema", command)
         self.assertEqual(command[-1], "-")
+        self.assertNotIn('service_tier="fast"', command)
+
+    def test_codex_command_passes_configured_service_tier_before_exec(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = Path(tmpdir)
+            with (
+                patch.object(llm_backend, "_resolve_codex_executable", return_value="codex.exe"),
+                patch.object(config, "CODEX_LUNA_SERVICE_TIER", "fast"),
+            ):
+                command = llm_backend._build_codex_command(runtime, runtime / "out.txt", None)
+        tier = command.index('service_tier="fast"')
+        self.assertEqual(command[tier - 1], "--config")
+        self.assertLess(tier, command.index("exec"))
 
     def test_codex_schema_requires_all_properties_and_removes_defaults(self):
         schema = LLMPayload.model_json_schema()

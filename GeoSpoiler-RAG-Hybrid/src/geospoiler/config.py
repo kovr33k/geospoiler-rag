@@ -26,6 +26,8 @@ TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_PHONE = os.getenv("TELEGRAM_PHONE", "")
 TELEGRAM_FOLDER = os.getenv("TELEGRAM_FOLDER", "GeoSpoiler")  # Telegram folder name to read from
+# Optional inclusive cutoff: a UTC date (YYYY-MM-DD) or ISO datetime; fetching stops at the first newer message
+TELEGRAM_FETCH_UNTIL = os.getenv("TELEGRAM_FETCH_UNTIL", "").strip()
 
 # ───────────────────────── LLM ─────────────────────────
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
@@ -46,6 +48,8 @@ CODEX_LUNA_MODEL = os.getenv("CODEX_LUNA_MODEL", "gpt-6-luna").strip()
 CODEX_LUNA_REASONING_EFFORT = (
     os.getenv("CODEX_LUNA_REASONING_EFFORT", "xhigh").strip().lower() or "xhigh"
 )
+# Optional Codex service tier, e.g. "fast"; empty keeps the account default
+CODEX_LUNA_SERVICE_TIER = os.getenv("CODEX_LUNA_SERVICE_TIER", "").strip().lower()
 CODEX_LLM_TIMEOUT_SECONDS = float(os.getenv("CODEX_LLM_TIMEOUT_SECONDS", "300"))
 CODEX_LLM_MAX_CONCURRENCY = max(1, int(os.getenv("CODEX_LLM_MAX_CONCURRENCY", "3")))
 CODEX_FALLBACK_TO_API = os.getenv("CODEX_FALLBACK_TO_API", "false").lower() == "true"
