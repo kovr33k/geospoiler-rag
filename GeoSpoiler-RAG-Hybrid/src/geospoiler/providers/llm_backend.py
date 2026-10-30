@@ -294,6 +294,8 @@ def _build_codex_command(
         "--output-last-message",
         str(output_path),
     ]
+    if config.CODEX_LUNA_SERVICE_TIER:
+        command[1:1] = ["--config", f'service_tier="{config.CODEX_LUNA_SERVICE_TIER}"']
     if schema_path is not None:
         command.extend(("--output-schema", str(schema_path)))
     command.append("-")
