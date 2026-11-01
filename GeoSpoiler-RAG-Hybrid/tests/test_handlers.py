@@ -18,6 +18,7 @@ from normalizer.instagram.downloader import (  # noqa: E402
     _get_info_ytdlp,
     _get_subtitles_from_info,
     _logged_missing_cookie_files,
+    _shortcode_to_media_pk,
     check_ytdlp_version,
     installed_ytdlp_version,
 )
@@ -1117,3 +1118,267 @@ class InstagramReviewAndCookiesTests(unittest.TestCase):
         self.assertNotIn("Cookies", logged)
         self.assertIn("unable to download webpage", logged)
         self.assertIn("exit=1", logged)
+
+
+_CAROUSEL_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "instagram_media_info_carousel.json"
+)
+_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _media_pk_for(shortcode: str) -> int:
+    """Reference shortcode decoder from the Instagram base64url alphabet."""
+    pk = 0
+    for char in shortcode:
+        pk = pk * 64 + _SHORTCODE_ALPHABET.index(char)
+    return pk
+
+
+class InstagramCarouselApiTests(unittest.TestCase):
+    def _netscape_cookies(self, directory: Path, secret: str) -> Path:
+        path = directory / "cookies.txt"
+        path.write_text(
+            "\n".join(
+                [
+                    "# Netscape HTTP Cookie File",
+                    f".instagram.com\tTRUE\t/\tTRUE\t9999999999\tsessionid\t{secret}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _json_response(self, payload: dict, status_code: int = 200):
+        response = Mock(status_code=status_code, content=b"{}")
+        response.json.return_value = payload
+        response.url = "https://www.instagram.com/api/v1/media/0/info/"
+        return response
+
+    def _image_response(self, image_url: str, body: bytes):
+        response = Mock(status_code=200, content=body)
+        response.url = image_url
+        response.json.side_effect = AssertionError("image body is not JSON")
+        return response
+
+    def test_shortcode_to_media_pk_matches_base64url_digits(self):
+        shortcode = "DPE1Bm9jMF3"
+        self.assertEqual(_shortcode_to_media_pk(shortcode), _media_pk_for(shortcode))
+        self.assertEqual(_shortcode_to_media_pk("-"), 62)
+        self.assertEqual(_shortcode_to_media_pk("_"), 63)
+
+    def test_api_downloads_fixture_slides_in_order_including_video_cover(self):
+        secret = "SESSION-SECRET-VALUE"
+        url = "https://www.instagram.com/p/DPE1Bm9jMF3/"
+        payload = json.loads(_CAROUSEL_FIXTURE.read_text(encoding="utf-8"))
+        slides = payload["items"][0]["carousel_media"]
+        video_at = [index for index, slide in enumerate(slides, start=1) if slide["media_type"] == 2]
+        self.assertEqual(video_at, [5])
+        for index, slide in enumerate(slides, start=1):
+            slide["image_versions2"]["candidates"][0]["url"] = (
+                f"https://scontent.cdninstagram.com/slide-{index:02d}.jpg"
+            )
+        media_pk = _media_pk_for("DPE1Bm9jMF3")
+        info_url = f"https://www.instagram.com/api/v1/media/{media_pk}/info/"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cookies = self._netscape_cookies(root, secret)
+            carousel = root / "carousel"
+            carousel.mkdir()
+            calls: list[str] = []
+
+            def fake_get(req_url, **kwargs):
+                calls.append(req_url)
+                self.assertIsNotNone(kwargs.get("timeout"))
+                self.assertGreater(kwargs["timeout"], 0)
+                if req_url == info_url:
+                    self.assertEqual(kwargs["headers"]["X-IG-App-ID"], "936619743392459")
+                    self.assertIn("Mozilla/", kwargs["headers"]["User-Agent"])
+                    values = [cookie.value for cookie in kwargs["cookies"]]
+                    self.assertEqual(values, [secret])
+                    return self._json_response(payload)
+                self.assertNotIn("cookies", kwargs)
+                self.assertNotIn("X-IG-App-ID", kwargs["headers"])
+                index = len(calls) - 1
+                return self._image_response(req_url, f"slide-{index:02d}".encode())
+
+            with patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch(
+                "normalizer.instagram.downloader.requests.get", side_effect=fake_get
+            ), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                side_effect=AssertionError("yt-dlp fallback"),
+            ):
+                images = _download_carousel_images(url, carousel, "DPE1Bm9jMF3", {})
+
+            names = [path.name for path in images]
+            self.assertEqual(
+                names,
+                [f"DPE1Bm9jMF3_{index:02d}.jpg" for index in range(1, len(slides) + 1)],
+            )
+            self.assertEqual(names, sorted(names))
+            self.assertEqual(
+                [path.read_bytes() for path in images],
+                [f"slide-{index:02d}".encode() for index in range(1, len(slides) + 1)],
+            )
+            self.assertEqual(images[4].read_bytes(), b"slide-05")
+            self.assertEqual(calls[0], info_url)
+            self.assertEqual(
+                calls[1:],
+                [f"https://scontent.cdninstagram.com/slide-{index:02d}.jpg" for index in range(1, 12)],
+            )
+            self.assertNotIn("https://scontent.cdninstagram.com/REDACTED.jpg", calls)
+            self.assertNotIn("https://scontent.cdninstagram.com/REDACTED.mp4", calls)
+
+    def test_api_downloads_single_photo(self):
+        secret = "SESSION-SECRET-VALUE"
+        url = "https://www.instagram.com/p/PHOTOONLY1/"
+        image_url = "https://scontent.cdninstagram.com/only.jpg"
+        payload = {
+            "items": [
+                {
+                    "media_type": 1,
+                    "image_versions2": {
+                        "candidates": [
+                            {"width": 1080, "height": 1080, "url": image_url},
+                            {"width": 640, "height": 640, "url": "https://scontent.cdninstagram.com/only-small.jpg"},
+                        ]
+                    },
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cookies = self._netscape_cookies(root, secret)
+            carousel = root / "carousel"
+            carousel.mkdir()
+            calls: list[str] = []
+
+            def fake_get(req_url, **kwargs):
+                calls.append(req_url)
+                self.assertIsNotNone(kwargs.get("timeout"))
+                if "api/v1/media/" in req_url:
+                    self.assertIn(str(_media_pk_for("PHOTOONLY1")), req_url)
+                    return self._json_response(payload)
+                return self._image_response(req_url, b"photo")
+
+            with patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch(
+                "normalizer.instagram.downloader.requests.get", side_effect=fake_get
+            ), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                side_effect=AssertionError("yt-dlp fallback"),
+            ):
+                images = _download_carousel_images(url, carousel, "PHOTOONLY1", {})
+
+            self.assertEqual([path.name for path in images], ["PHOTOONLY1_01.jpg"])
+            self.assertEqual(images[0].read_bytes(), b"photo")
+            self.assertEqual(calls, [calls[0], image_url])
+
+    def test_api_failure_falls_back_to_ytdlp(self):
+        secret = "SESSION-SECRET-VALUE"
+        url = "https://www.instagram.com/p/FAILAPI1/"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cookies = self._netscape_cookies(root, secret)
+            carousel = root / "carousel"
+            carousel.mkdir()
+            failed = Mock(status_code=500, content=f"body {secret}".encode())
+            failed.json.side_effect = ValueError("not json")
+            failed.url = url
+            with patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch(
+                "normalizer.instagram.downloader.requests.get", return_value=failed
+            ) as get, patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                return_value=Mock(returncode=0, stdout="", stderr=""),
+            ) as run, self.assertLogs("geospoiler.normalizer.instagram", level="WARNING") as logs:
+                images = _download_carousel_images(url, carousel, "FAILAPI1", {})
+
+        logged = "\n".join(logs.output)
+        self.assertEqual(images, [])
+        self.assertEqual(get.call_count, 1)
+        self.assertIn("api/v1/media/", get.call_args.args[0])
+        self.assertIn("timeout", get.call_args.kwargs)
+        command = run.call_args.args[0]
+        self.assertIn("yt_dlp", command)
+        self.assertIn(url, command)
+        self.assertIn(url, logged)
+        self.assertIn("status=500", logged)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("sessionid", logged)
+
+    def test_api_not_called_without_configured_cookies(self):
+        url = "https://www.instagram.com/p/NOCOOKIE1/"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            carousel = Path(tmpdir) / "carousel"
+            carousel.mkdir()
+            with patch.object(config, "INSTAGRAM_COOKIES_FILE", None), patch(
+                "normalizer.instagram.downloader.requests.get"
+            ) as get, patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                return_value=Mock(returncode=0, stdout="", stderr=""),
+            ) as run:
+                images = _download_carousel_images(url, carousel, "NOCOOKIE1", {})
+
+        self.assertEqual(images, [])
+        get.assert_not_called()
+        command = run.call_args.args[0]
+        self.assertIn("yt_dlp", command)
+        self.assertIn(url, command)
+        self.assertNotIn("--cookies", command)
+
+    def test_non_cdn_image_url_is_rejected(self):
+        secret = "SESSION-SECRET-VALUE"
+        url = "https://www.instagram.com/p/CDNCHECK1/"
+        good_url = "https://scontent.cdninstagram.com/ok.jpg"
+        rejected = [
+            "https://evil.example/secret.jpg",
+            "http://scontent.cdninstagram.com/plain.jpg",
+            "https://cdninstagram.com.evil.example/lookalike.jpg",
+        ]
+        payload = {
+            "items": [
+                {
+                    "media_type": 8,
+                    "carousel_media": [
+                        {
+                            "media_type": 1,
+                            "image_versions2": {"candidates": [{"url": good_url, "width": 10, "height": 10}]},
+                        },
+                        *[
+                            {
+                                "media_type": 1,
+                                "image_versions2": {"candidates": [{"url": bad, "width": 10, "height": 10}]},
+                            }
+                            for bad in rejected
+                        ],
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cookies = self._netscape_cookies(root, secret)
+            carousel = root / "carousel"
+            carousel.mkdir()
+            calls: list[str] = []
+
+            def fake_get(req_url, **kwargs):
+                calls.append(req_url)
+                if "api/v1/media/" in req_url:
+                    self.assertIsNotNone(kwargs.get("timeout"))
+                    return self._json_response(payload)
+                return self._image_response(req_url, b"ok")
+
+            with patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch(
+                "normalizer.instagram.downloader.requests.get", side_effect=fake_get
+            ), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                side_effect=AssertionError("yt-dlp fallback"),
+            ):
+                images = _download_carousel_images(url, carousel, "CDNCHECK1", {})
+
+            self.assertEqual([path.name for path in images], ["CDNCHECK1_01.jpg"])
+            self.assertEqual(images[0].read_bytes(), b"ok")
+            self.assertEqual(calls, [calls[0], good_url])
+            for bad in rejected:
+                self.assertNotIn(bad, calls)
