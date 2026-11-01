@@ -1,5 +1,6 @@
 """Instagram URL, yt-dlp, download, and subtitle helpers."""
 
+import http.cookiejar
 import json
 import logging
 import re
@@ -25,6 +26,20 @@ _INSTAGRAM_HOSTS = frozenset(
     }
 )
 _INSTAGRAM_PATH_RE = re.compile(r"^/(?:reel|p)/[A-Za-z0-9_-]+/?$", re.IGNORECASE)
+# Instagram web app id. Photo carousels are read from the media info API with this header.
+_IG_APP_ID = "936619743392459"
+_IG_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+# Base64url alphabet used by Instagram shortcodes. Index is the digit value.
+_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_CAROUSEL_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+_CAROUSEL_SLIDE_LIMIT = 20
+_INSTAGRAM_HTTP_TIMEOUT_SECONDS = 30
+# Real CDN domains only. A host that merely ends with the same letters is not enough.
+_CDN_IMAGE_HOST_SUFFIXES = ("cdninstagram.com", "fbcdn.net")
 
 
 def is_valid_instagram_url(url: str) -> bool:
@@ -343,13 +358,193 @@ def _download_video(url: str, work_dir: Path, post_id: str) -> Path | None:
     return None
 
 
+def _shortcode_to_media_pk(shortcode: str) -> int:
+    """Decode an Instagram shortcode into the numeric media id."""
+    pk = 0
+    for char in shortcode:
+        pk = pk * 64 + _SHORTCODE_ALPHABET.index(char)
+    return pk
+
+
+def _is_instagram_cdn_image_url(image_url: str) -> bool:
+    """True for https URLs on cdninstagram.com or fbcdn.net."""
+    parsed = urlsplit(str(image_url or "").strip())
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").rstrip(".").casefold()
+    return any(
+        host == suffix or host.endswith("." + suffix) for suffix in _CDN_IMAGE_HOST_SUFFIXES
+    )
+
+
+def _carousel_image_suffix(image_url: str) -> str:
+    suffix = Path(urlsplit(image_url).path).suffix.lower()
+    if suffix in _CAROUSEL_IMAGE_EXTS:
+        return suffix
+    return ".jpg"
+
+
+def _log_carousel_api_failure(url: str, status: int | str | None) -> None:
+    """Log a carousel API failure with the post URL and status only.
+
+    Cookie values, cookie-file contents, and response bodies stay out of the message.
+    """
+    logger.warning(
+        "Instagram carousel API failed for %s (status=%s)",
+        url,
+        "none" if status is None else status,
+    )
+
+
+def _instagram_media_slides(payload: object) -> list[dict] | None:
+    """Return photo/carousel slides from a media info payload, capped at the slide limit."""
+    if not isinstance(payload, dict):
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    item = items[0]
+    media_type = item.get("media_type")
+    if media_type == 8:
+        slides = item.get("carousel_media")
+        if not isinstance(slides, list):
+            return None
+        return [slide for slide in slides if isinstance(slide, dict)][:_CAROUSEL_SLIDE_LIMIT]
+    if media_type == 1:
+        return [item]
+    return None
+
+
+def _slide_image_url(slide: dict) -> str | None:
+    """Largest image for a photo, or the cover image of a video slide."""
+    if slide.get("media_type") not in (1, 2):
+        return None
+    versions = slide.get("image_versions2")
+    if not isinstance(versions, dict):
+        return None
+    candidates = versions.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        return None
+    image_url = candidates[0].get("url")
+    if not isinstance(image_url, str) or not image_url.strip():
+        return None
+    return image_url.strip()
+
+
+def _download_cdn_image(image_url: str, dest: Path) -> int | None:
+    """Save one CDN image. Return the HTTP status when the save did not happen."""
+    try:
+        response = requests.get(
+            image_url,
+            headers={"User-Agent": _IG_BROWSER_USER_AGENT},
+            timeout=_INSTAGRAM_HTTP_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200 or not response.content:
+        return response.status_code
+    final_url = response.url if isinstance(getattr(response, "url", None), str) else image_url
+    if not _is_instagram_cdn_image_url(final_url):
+        return response.status_code
+    try:
+        dest.write_bytes(response.content)
+    except OSError:
+        dest.unlink(missing_ok=True)
+        return response.status_code
+    return None
+
+
+def _download_carousel_images_via_api(
+    url: str, carousel_dir: Path, post_id: str, cookies_path: str
+) -> list[Path]:
+    """Download slide images from Instagram's web media API.
+
+    An empty list means the caller should fall back to yt-dlp. Saved names use a
+    zero-padded slide index so a lexical sort stays in slide order.
+    """
+    jar = http.cookiejar.MozillaCookieJar(cookies_path)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError:
+        _log_carousel_api_failure(url, None)
+        return []
+
+    shortcode = _extract_post_id(url)
+    if not shortcode:
+        _log_carousel_api_failure(url, None)
+        return []
+    try:
+        media_pk = _shortcode_to_media_pk(shortcode)
+    except ValueError:
+        _log_carousel_api_failure(url, None)
+        return []
+
+    try:
+        response = requests.get(
+            f"https://www.instagram.com/api/v1/media/{media_pk}/info/",
+            headers={
+                "User-Agent": _IG_BROWSER_USER_AGENT,
+                "X-IG-App-ID": _IG_APP_ID,
+            },
+            cookies=jar,
+            timeout=_INSTAGRAM_HTTP_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        _log_carousel_api_failure(url, None)
+        return []
+
+    status = response.status_code
+    if status != 200:
+        _log_carousel_api_failure(url, status)
+        return []
+    try:
+        payload = response.json()
+    except ValueError:
+        _log_carousel_api_failure(url, status)
+        return []
+
+    slides = _instagram_media_slides(payload)
+    if not slides:
+        _log_carousel_api_failure(url, status)
+        return []
+
+    saved: list[Path] = []
+    image_status: int | None = None
+    for index, slide in enumerate(slides, start=1):
+        image_url = _slide_image_url(slide)
+        if not image_url or not _is_instagram_cdn_image_url(image_url):
+            continue
+        dest = carousel_dir / f"{post_id}_{index:02d}{_carousel_image_suffix(image_url)}"
+        failed_status = _download_cdn_image(image_url, dest)
+        if failed_status is None and dest.is_file():
+            saved.append(dest)
+        elif failed_status is not None:
+            image_status = failed_status
+    if not saved:
+        _log_carousel_api_failure(url, image_status if image_status is not None else status)
+        return []
+    return saved
+
+
 def _download_carousel_images(
     url: str, carousel_dir: Path, post_id: str, info: dict
 ) -> list[Path]:
-    """Download carousel images via yt-dlp."""
+    """Download carousel images, using the web API when cookies are configured."""
     if not is_valid_instagram_url(url):
         logger.warning("Rejected non-Instagram URL before carousel download: %s", url)
         return []
+    cookies_args = _instagram_cookies_args()
+    if cookies_args:
+        images = _download_carousel_images_via_api(url, carousel_dir, post_id, cookies_args[1])
+        if images:
+            return images
+    return _download_carousel_images_ytdlp(url, carousel_dir, post_id)
+
+
+def _download_carousel_images_ytdlp(url: str, carousel_dir: Path, post_id: str) -> list[Path]:
+    """Download carousel images via yt-dlp and keep the image files."""
     out_template = str(carousel_dir / f"{post_id}_%(autonumber)s.%(ext)s")
     try:
         subprocess.run(
@@ -370,10 +565,9 @@ def _download_carousel_images(
         logger.error("yt-dlp not found")
         return []
 
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     images = sorted(
         p for p in carousel_dir.iterdir()
-        if p.suffix.lower() in image_exts
+        if p.suffix.lower() in _CAROUSEL_IMAGE_EXTS
     )
     return images
 
