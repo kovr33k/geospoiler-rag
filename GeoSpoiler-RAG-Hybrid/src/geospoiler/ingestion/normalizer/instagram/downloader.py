@@ -46,6 +46,69 @@ def _yt_dlp_command(*args: str) -> list[str]:
     return [sys.executable, "-m", "yt_dlp", *args]
 
 
+# One warning per missing path. The cookies file itself is never read or logged.
+_logged_missing_cookie_files: set[str] = set()
+
+
+def _instagram_cookies_args() -> list[str]:
+    """``--cookies <path>`` when the configured file exists.
+
+    A set-but-missing file logs one warning with the path only, then extraction
+    continues without cookies.
+    """
+    configured = config.INSTAGRAM_COOKIES_FILE
+    if not configured:
+        return []
+    path = Path(configured)
+    if not path.is_file():
+        key = str(path)
+        if key not in _logged_missing_cookie_files:
+            _logged_missing_cookie_files.add(key)
+            logger.warning("Instagram cookies file is missing: %s", path)
+        return []
+    return ["--cookies", str(path)]
+
+
+def _instagram_ytdlp_command(*args: str) -> list[str]:
+    """yt-dlp command for Instagram content, including cookies when configured."""
+    return _yt_dlp_command(*_instagram_cookies_args(), *args)
+
+
+def _ytdlp_stderr_for_log(stderr: str) -> str:
+    """Stderr tail safe to log.
+
+    With cookies configured, yt-dlp prints malformed cookie rows verbatim.
+    Drop any line that mentions cookies or is tab-separated, then keep a
+    short tail of what remains.
+    """
+    text = stderr or ""
+    if _instagram_cookies_args():
+        kept = [
+            line
+            for line in text.splitlines()
+            if "cookie" not in line.casefold() and "\t" not in line
+        ]
+        text = "\n".join(kept)
+    collapsed = " ".join(text.split())
+    return collapsed[-1000:]
+
+
+def _ytdlp_json_objects(stdout: str) -> list[dict]:
+    """Parse yt-dlp stdout as one JSON object per line."""
+    objects: list[dict] = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+    return objects
+
+
 def check_ytdlp_version(*, force: bool = False) -> dict[str, str]:
     """Verify the active interpreter's yt-dlp against minimum and stable release."""
     global _YTDLP_PREFLIGHT, _YTDLP_PREFLIGHT_AT
@@ -191,15 +254,33 @@ def _get_info_ytdlp(url: str) -> dict | None:
         )
     try:
         result = subprocess.run(
-            _yt_dlp_command("--dump-json", "--no-download", "--no-warnings", url),
+            _instagram_ytdlp_command(
+                "--dump-json",
+                "--no-download",
+                "--no-warnings",
+                "--ignore-no-formats-error",
+                url,
+            ),
             capture_output=True,
             text=True,
             timeout=30,
             encoding="utf-8",
         )
-        if result.returncode == 0 and result.stdout:
-            return json.loads(result.stdout)
-        details = (result.stderr or "").strip().replace("\r", " ").replace("\n", " ")
+        objects = _ytdlp_json_objects(result.stdout)
+        if objects:
+            # Mixed carousels can print one JSON object per line and still exit
+            # non-zero. Photo-only posts do the same without a video format.
+            if result.returncode != 0:
+                logger.warning(
+                    "yt-dlp metadata for %s exited %s; using parsed JSON",
+                    url,
+                    result.returncode,
+                )
+            return next((o for o in objects if o.get("description") or o.get("title")), objects[0])
+        if result.returncode == 0 and (result.stdout or "").strip():
+            logger.warning("yt-dlp returned invalid JSON for %s", url)
+            return None
+        details = _ytdlp_stderr_for_log(result.stderr)
         if details:
             logger.warning(
                 "yt-dlp metadata extraction failed for %s (exit=%s): %s",
@@ -215,8 +296,6 @@ def _get_info_ytdlp(url: str) -> dict | None:
             )
     except subprocess.TimeoutExpired:
         logger.warning(f"yt-dlp timeout for {url}")
-    except json.JSONDecodeError:
-        logger.warning(f"yt-dlp returned invalid JSON for {url}")
     except FileNotFoundError:
         logger.error("yt-dlp not found — install it: pip install yt-dlp")
     return None
@@ -230,7 +309,7 @@ def _download_video(url: str, work_dir: Path, post_id: str) -> Path | None:
     out_path = work_dir / f"{post_id}.%(ext)s"
     try:
         subprocess.run(
-            _yt_dlp_command(
+            _instagram_ytdlp_command(
                 "-f", "best[ext=mp4]/best",
                 "--no-warnings",
                 "--max-filesize", f"{config.INSTAGRAM_MAX_VIDEO_SIZE_MB}M",
@@ -274,7 +353,7 @@ def _download_carousel_images(
     out_template = str(carousel_dir / f"{post_id}_%(autonumber)s.%(ext)s")
     try:
         subprocess.run(
-            _yt_dlp_command(
+            _instagram_ytdlp_command(
                 "--no-warnings",
                 "-o", out_template,
                 url,
@@ -329,7 +408,7 @@ def _get_subtitles_from_info(url: str, info: dict) -> str | None:
     sub_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        cmd = _yt_dlp_command(
+        cmd = _instagram_ytdlp_command(
             "--skip-download",
             "--no-warnings",
             "--write-subs" if not use_auto else "--write-auto-subs",

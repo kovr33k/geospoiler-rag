@@ -177,6 +177,113 @@ def mark_reviewed(
     )
 
 
+# Processed items the enricher may substitute into a post. Enrichment failures
+# are diagnostics, not source text.
+_APPLICABLE_REVIEW_TYPES = frozenset(
+    {
+        REVIEW_TYPE_AI_CHAT,
+        REVIEW_TYPE_EXTERNAL_LINK,
+        REVIEW_TYPE_INSTAGRAM_LONG_REEL,
+        REVIEW_TYPE_UNINFORMATIVE,
+    }
+)
+
+
+def processed_reviews_for_post(channel: str, message_id: int | str) -> list[dict]:
+    """Return processed review texts for one post, ordered by file name.
+
+    Candidates are the sanitized ``{channel}_{message_id}_*.json`` files.
+    JSON ``channel`` and ``message_id`` must still match, so ``росия_42``
+    never accepts a file that belongs to ``росия_423``.
+    """
+    prefix = _sanitize(f"{channel}_{message_id}_")
+    queue_dir = config.REVIEW_QUEUE_DIR
+    if not queue_dir.is_dir():
+        return []
+
+    items: list[dict] = []
+    for path in sorted(queue_dir.glob(f"{prefix}*.json"), key=lambda item: item.name):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("channel") != channel or str(data.get("message_id")) != str(message_id):
+            continue
+        if data.get("status") != "processed":
+            continue
+        if data.get("review_type") not in _APPLICABLE_REVIEW_TYPES:
+            continue
+        extracted = data.get("extracted_text")
+        if not isinstance(extracted, str) or not extracted.strip():
+            continue
+        data["_filename"] = path.name
+        items.append(data)
+    return items
+
+
+def apply_reviewed_texts(normalized_text: str, items: list[dict]) -> str:
+    """Substitute processed review text into normalized post text.
+
+    Each item replaces its exact ``[Отправлено в очередь на ручной просмотр: <file>]``
+    or ``[Уже обработано: <file>]`` line. An item with no such line is appended.
+    Text with no applicable items is returned unchanged.
+    """
+    if not items:
+        return normalized_text
+
+    text = normalized_text
+    appended: list[str] = []
+    for item in items:
+        filename = str(item.get("_filename") or "")
+        extracted = str(item.get("extracted_text") or "").strip()
+        if not filename or not extracted:
+            continue
+        block = f"[Текст из ревью: {filename}]\n{extracted}"
+        queued = f"[Отправлено в очередь на ручной просмотр: {filename}]"
+        already = f"[Уже обработано: {filename}]"
+        if queued in text:
+            text = text.replace(queued, block)
+        elif already in text:
+            text = text.replace(already, block)
+        else:
+            appended.append(block)
+    if not appended:
+        return text
+
+    addition = "\n\n".join(appended)
+    base = text.rstrip()
+    if not base:
+        return addition
+    return f"{base}\n\n{addition}"
+
+
+def reopen_review(filepath: str) -> None:
+    """Move a finished review item back to pending.
+
+    The saved extraction is kept as ``previous_extracted_text`` for reference.
+    Every other field stays as it was.
+    """
+    path = config.resolve_project_path(filepath)
+    if not path.exists():
+        logger.warning(f"Review file not found: {filepath}")
+        return
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["previous_extracted_text"] = data.get("extracted_text")
+    data["previous_reviewed_at"] = data.get("reviewed_at")
+    data["reopened_from_status"] = data.get("status")
+    data["status"] = "pending"
+    data["extracted_text"] = None
+    data["reviewed_at"] = None
+
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def _already_reviewed_placeholder(review_type: str, url: str, filename: str) -> str:
     """Build placeholder text for already-reviewed items."""
     label = _type_label(review_type)

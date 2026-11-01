@@ -8,6 +8,10 @@ from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_INSTAGRAM_L
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
 
 
+class InstagramExtractionError(RuntimeError):
+    """Extraction failed and must not write a review-queue file."""
+
+
 def build_reel_text(
     url: str,
     caption: str,
@@ -69,8 +73,12 @@ def _queue_long_reel_for_review(
     message_id: int,
     message_text: str,
     message_date: datetime | None,
+    queue_failures: bool = True,
 ) -> str:
     """Queue a long Reel through the unified manual review queue."""
+    reason = f"Duration {duration}s exceeds limit {config.INSTAGRAM_MAX_VIDEO_DURATION_SEC}s"
+    if not queue_failures:
+        raise InstagramExtractionError(reason)
     result = queue_review_item(
         review_type=REVIEW_TYPE_INSTAGRAM_LONG_REEL,
         channel_name=channel_name,
@@ -78,7 +86,7 @@ def _queue_long_reel_for_review(
         message_text=message_text or caption,
         message_date=message_date,
         url=url,
-        reason=f"Duration {duration}s exceeds limit {config.INSTAGRAM_MAX_VIDEO_DURATION_SEC}s",
+        reason=reason,
     )
     parts = [_instagram_header("Reel", url, uploader)]
     if caption:

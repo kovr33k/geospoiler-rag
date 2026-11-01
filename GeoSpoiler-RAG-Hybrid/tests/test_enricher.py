@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import tempfile
@@ -86,6 +87,32 @@ class AutoTriageTests(unittest.TestCase):
 
         self.assertEqual(triage, "review")
         self.assertIn("needs Whisper", reason)
+
+    def test_ai_chat_with_reviewed_text_is_kept(self):
+        text = (
+            "[AI-диалог: https://chatgpt.com/share/abc]\n"
+            "[Текст из ревью: Channel_7_ab.json]\n"
+            "Порт Нарвы закрыли после удара."
+        )
+
+        triage, _reason = auto_triage(
+            "mixed_normalized_text",
+            {"ai_chat_urls": ["https://chatgpt.com/share/abc"]},
+            text,
+        )
+
+        self.assertEqual(triage, "keep")
+
+    def test_unreviewed_ai_chat_still_requires_review(self):
+        text = "[Отправлено в очередь на ручной просмотр: Channel_7_ab.json]"
+
+        triage, _reason = auto_triage(
+            "mixed_normalized_text",
+            {"ai_chat_urls": ["https://chatgpt.com/share/abc"]},
+            text,
+        )
+
+        self.assertEqual(triage, "review")
 
 
 class PipelineQualityFlagTests(unittest.TestCase):
@@ -1166,6 +1193,406 @@ class EnrichedV2BoundaryTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(repaired.summary, "original")
         self.assertIn("extraction_unstable", repaired.quality_flags)
+
+
+def _legacy_source_fingerprint(txt_path: Path, meta_path: Path) -> str:
+    """Fingerprint of the normalized pair alone, before review texts existed."""
+    digest = hashlib.sha256()
+    for label, path in ((b"text", txt_path), (b"meta", meta_path)):
+        data = path.read_bytes()
+        digest.update(label)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+class ReviewedTextEnrichmentTests(unittest.TestCase):
+    def _write_pair(self, root: Path) -> tuple[Path, Path]:
+        channel = root / "normalized" / "Channel"
+        channel.mkdir(parents=True)
+        txt_path = channel / "7.txt"
+        meta_path = channel / "7.meta.json"
+        txt_path.write_text(
+            "[AI-диалог: https://chatgpt.com/share/abc]\n"
+            "[Отправлено в очередь на ручной просмотр: Channel_7_deadbeef.json]",
+            encoding="utf-8",
+        )
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "channel_name": "Channel",
+                    "channel_id": 100,
+                    "message_id": 7,
+                    "ai_chat_urls": ["https://chatgpt.com/share/abc"],
+                    "has_text": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return txt_path, meta_path
+
+    def _write_review(self, queue_dir: Path, name: str, **overrides) -> None:
+        payload = {
+            "review_type": "external_link",
+            "channel": "Channel",
+            "message_id": 7,
+            "status": "processed",
+            "extracted_text": "Порт Нарвы закрыли после удара по причалу, движение судов остановлено.",
+        }
+        payload.update(overrides)
+        (queue_dir / name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_fingerprint_ignores_inapplicable_items_and_changes_with_reviewed_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review"
+            queue_dir.mkdir()
+            txt_path, meta_path = self._write_pair(root)
+            legacy = _legacy_source_fingerprint(txt_path, meta_path)
+            enriched_dir = root / "enriched"
+            with patch.object(enricher_pipeline.config, "REVIEW_QUEUE_DIR", queue_dir), \
+                 patch.object(enricher_pipeline.config, "NORMALIZED_DIR", root / "normalized"), \
+                 patch.object(enricher_pipeline.config, "ENRICHED_DIR", enriched_dir):
+                self.assertEqual(
+                    enricher_pipeline._source_fingerprint(txt_path, meta_path),
+                    legacy,
+                )
+                self._write_review(
+                    queue_dir,
+                    "Channel_7_pending.json",
+                    status="pending",
+                    extracted_text=None,
+                )
+                self._write_review(
+                    queue_dir,
+                    "Channel_7_skipped.json",
+                    status="skipped",
+                    extracted_text="Пропущенный текст не входит в карточку.",
+                )
+                self._write_review(
+                    queue_dir,
+                    "Channel_7_failure.json",
+                    review_type="enrichment_failure",
+                    extracted_text="Текст ошибки обогащения не входит в карточку.",
+                )
+                self._write_review(
+                    queue_dir,
+                    "Channel_7_blank.json",
+                    extracted_text="   ",
+                )
+                self.assertEqual(
+                    enricher_pipeline._source_fingerprint(txt_path, meta_path),
+                    legacy,
+                )
+
+                self._write_review(queue_dir, "Channel_7_deadbeef.json")
+                with_review = enricher_pipeline._source_fingerprint(txt_path, meta_path)
+                self.assertNotEqual(with_review, legacy)
+
+                reviewed = json.loads((queue_dir / "Channel_7_deadbeef.json").read_text(encoding="utf-8"))
+                reviewed["extracted_text"] = "Новый текст ревью про закрытый порт Нарвы."
+                (queue_dir / "Channel_7_deadbeef.json").write_text(
+                    json.dumps(reviewed, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                changed = enricher_pipeline._source_fingerprint(txt_path, meta_path)
+                self.assertNotEqual(changed, with_review)
+
+                card_dir = enriched_dir / "Channel"
+                card_dir.mkdir(parents=True)
+                card = EnrichedCardV2(
+                    summary="Источник сообщил о переговорах.",
+                    schema_version=enricher_pipeline.config.ENRICHMENT_SCHEMA_VERSION,
+                    prompt_version=enricher_pipeline.config.ENRICHMENT_PROMPT_VERSION,
+                    enrichment_model=enricher_pipeline.llm_backend.active_model_for("enrichment"),
+                    media_contract_version=enricher_pipeline._MEDIA_CONTRACT_VERSION,
+                    enriched_at="2026-01-01T00:00:00+00:00",
+                    provenance={"source_id": "telegram:100:7"},
+                )
+                (card_dir / "7.enriched.json").write_text(card.model_dump_json(), encoding="utf-8")
+                progress = {
+                    "enriched": {
+                        "Channel/7": {
+                            "source_fingerprint": changed,
+                            "schema_version": enricher_pipeline.config.ENRICHMENT_SCHEMA_VERSION,
+                            "prompt_version": enricher_pipeline.config.ENRICHMENT_PROMPT_VERSION,
+                            "enrichment_model": enricher_pipeline.llm_backend.active_model_for(
+                                "enrichment"
+                            ),
+                            "media_contract_version": enricher_pipeline._MEDIA_CONTRACT_VERSION,
+                        }
+                    }
+                }
+                skipped = enricher_pipeline.EnrichmentStats()
+                self.assertEqual(
+                    enricher_pipeline._collect_enrichment_jobs(
+                        progress=progress,
+                        channel_filter="Channel",
+                        force=False,
+                        stats=skipped,
+                    ),
+                    [],
+                )
+                reviewed["extracted_text"] = "Ещё одна правка текста ревью про порт Нарвы."
+                (queue_dir / "Channel_7_deadbeef.json").write_text(
+                    json.dumps(reviewed, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                refreshed = enricher_pipeline.EnrichmentStats()
+                jobs = enricher_pipeline._collect_enrichment_jobs(
+                    progress=progress,
+                    channel_filter="Channel",
+                    force=False,
+                    stats=refreshed,
+                )
+                self.assertEqual(skipped.skipped_up_to_date, 1)
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(
+                    jobs[0].source_fingerprint,
+                    enricher_pipeline._source_fingerprint(txt_path, meta_path),
+                )
+
+    def test_placeholder_only_post_is_enriched_from_reviewed_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review"
+            queue_dir.mkdir()
+            txt_path, meta_path = self._write_pair(root)
+            original = txt_path.read_bytes()
+            job = enricher_pipeline._EnrichmentJob(
+                txt_path=txt_path,
+                meta_path=meta_path,
+                channel_name="Channel",
+                msg_id="7",
+                progress_key="Channel/7",
+                source_fingerprint="unused",
+                out_path=root / "7.enriched.json",
+            )
+            seen = {}
+
+            def fake_extract(preprocessed, content_type):
+                seen["text"] = preprocessed.clean_text
+                seen["content_type"] = content_type
+                return {"summary": "Порт Нарвы закрыли после удара по причалу."}
+
+            with patch.object(enricher_pipeline.config, "REVIEW_QUEUE_DIR", queue_dir), \
+                 patch.object(enricher_pipeline.config, "PROJECT_ROOT", root):
+                self.assertIsNone(
+                    enricher_pipeline._run_enrichment_job(job, enricher_pipeline.EnrichmentStats())
+                )
+                self._write_review(queue_dir, "Channel_7_deadbeef.json")
+                with patch.object(
+                    enricher_pipeline,
+                    "extract_short_post_raw",
+                    side_effect=fake_extract,
+                ):
+                    result = enricher_pipeline._run_enrichment_job(
+                        job,
+                        enricher_pipeline.EnrichmentStats(),
+                    )
+                self.assertIsNotNone(result)
+                self.assertIn("Порт Нарвы закрыли после удара", seen["text"])
+                self.assertNotIn("Отправлено в очередь", seen["text"])
+                self.assertEqual(result["summary"], "Порт Нарвы закрыли после удара по причалу.")
+                self.assertEqual(txt_path.read_bytes(), original)
+
+    def test_slash_channel_in_metadata_matches_sanitized_directory(self):
+        channel = "Израиль/палестина"
+        directory = "Израиль_палестина"
+        filename = f"{directory}_7_ab.json"
+        sentence = "Порт Нарвы закрыли после удара по причалу, движение судов остановлено."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review"
+            queue_dir.mkdir()
+            channel_dir = root / "normalized" / directory
+            channel_dir.mkdir(parents=True)
+            txt_path = channel_dir / "7.txt"
+            meta_path = channel_dir / "7.meta.json"
+            txt_path.write_text(
+                "[AI-диалог: https://chatgpt.com/share/abc]\n"
+                f"[Отправлено в очередь на ручной просмотр: {filename}]",
+                encoding="utf-8",
+            )
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "channel_name": channel,
+                        "channel_id": 100,
+                        "message_id": 7,
+                        "ai_chat_urls": ["https://chatgpt.com/share/abc"],
+                        "has_text": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy = _legacy_source_fingerprint(txt_path, meta_path)
+            job = enricher_pipeline._EnrichmentJob(
+                txt_path=txt_path,
+                meta_path=meta_path,
+                channel_name=directory,
+                msg_id="7",
+                progress_key=f"{directory}/7",
+                source_fingerprint="unused",
+                out_path=root / "7.enriched.json",
+            )
+            seen = {}
+
+            def fake_extract(preprocessed, content_type):
+                seen["text"] = preprocessed.clean_text
+                return {"summary": "Порт Нарвы закрыли после удара по причалу."}
+
+            with patch.object(enricher_pipeline.config, "REVIEW_QUEUE_DIR", queue_dir), \
+                 patch.object(enricher_pipeline.config, "PROJECT_ROOT", root):
+                self.assertEqual(
+                    enricher_pipeline._source_fingerprint(txt_path, meta_path),
+                    legacy,
+                )
+                self.assertIsNone(
+                    enricher_pipeline._run_enrichment_job(job, enricher_pipeline.EnrichmentStats())
+                )
+                queued = list(queue_dir.glob("*.json"))
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(
+                    json.loads(queued[0].read_text(encoding="utf-8"))["channel"],
+                    channel,
+                )
+
+                self._write_review(
+                    queue_dir,
+                    filename,
+                    channel=channel,
+                    extracted_text=sentence,
+                )
+                self.assertNotEqual(
+                    enricher_pipeline._source_fingerprint(txt_path, meta_path),
+                    legacy,
+                )
+                with patch.object(
+                    enricher_pipeline,
+                    "extract_short_post_raw",
+                    side_effect=fake_extract,
+                ):
+                    result = enricher_pipeline._run_enrichment_job(
+                        job,
+                        enricher_pipeline.EnrichmentStats(),
+                    )
+
+            self.assertIsNotNone(result)
+            self.assertIn(sentence, seen["text"])
+            self.assertEqual(txt_path.read_bytes().decode("utf-8").count(sentence), 0)
+
+    def test_reviewed_youtube_only_post_is_enriched_from_review_text(self):
+        channel = "Израиль/палестина"
+        directory = "Израиль_палестина"
+        url = "https://www.youtube.com/watch?v=abc123desc"
+        sentence = "Стенограмма называет закрытие порта Нарвы после удара по причалу."
+        filename = f"{directory}_9_ab.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review"
+            queue_dir.mkdir()
+            channel_dir = root / "normalized" / directory
+            channel_dir.mkdir(parents=True)
+            txt_path = channel_dir / "9.txt"
+            meta_path = channel_dir / "9.meta.json"
+            txt_path.write_text(
+                "[YouTube]\n"
+                "Автор: неизвестно\n"
+                "Название: без названия\n"
+                f"URL: {url}\n\n"
+                f"[YouTube: не удалось получить информацию — {url}]",
+                encoding="utf-8",
+            )
+            original = txt_path.read_bytes()
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "channel_name": channel,
+                        "channel_id": 100,
+                        "message_id": 9,
+                        "youtube_urls": [url],
+                        "has_text": False,
+                        "has_body_text": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            seen = {}
+
+            def fake_extract(preprocessed, content_type):
+                seen["text"] = preprocessed.clean_text
+                seen["content_type"] = content_type
+                return {"summary": "Порт Нарвы закрыли после удара по причалу."}
+
+            with patch.object(enricher_pipeline.config, "REVIEW_QUEUE_DIR", queue_dir), \
+                 patch.object(enricher_pipeline.config, "NORMALIZED_DIR", root / "normalized"), \
+                 patch.object(enricher_pipeline.config, "ENRICHED_DIR", root / "enriched"), \
+                 patch.object(enricher_pipeline.config, "PROJECT_ROOT", root):
+                skipped = enricher_pipeline.EnrichmentStats()
+                self.assertEqual(
+                    enricher_pipeline._collect_enrichment_jobs(
+                        progress={"enriched": {}},
+                        channel_filter=directory,
+                        force=False,
+                        stats=skipped,
+                    ),
+                    [],
+                )
+                self.assertEqual(skipped.skipped_youtube, 1)
+
+                self._write_review(
+                    queue_dir,
+                    f"{directory}_9_pending.json",
+                    channel=channel,
+                    message_id=9,
+                    status="pending",
+                    extracted_text=None,
+                )
+                pending = enricher_pipeline.EnrichmentStats()
+                self.assertEqual(
+                    enricher_pipeline._collect_enrichment_jobs(
+                        progress={"enriched": {}},
+                        channel_filter=directory,
+                        force=False,
+                        stats=pending,
+                    ),
+                    [],
+                )
+                self.assertEqual(pending.skipped_youtube, 1)
+
+                self._write_review(
+                    queue_dir,
+                    filename,
+                    channel=channel,
+                    message_id=9,
+                    extracted_text=sentence,
+                )
+                collected = enricher_pipeline.EnrichmentStats()
+                jobs = enricher_pipeline._collect_enrichment_jobs(
+                    progress={"enriched": {}},
+                    channel_filter=directory,
+                    force=False,
+                    stats=collected,
+                )
+                self.assertEqual(collected.skipped_youtube, 0)
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0].txt_path, txt_path)
+                with patch.object(
+                    enricher_pipeline,
+                    "extract_short_post_raw",
+                    side_effect=fake_extract,
+                ):
+                    result = enricher_pipeline._run_enrichment_job(
+                        jobs[0],
+                        enricher_pipeline.EnrichmentStats(),
+                    )
+
+            self.assertIsNotNone(result)
+            self.assertIn(sentence, seen["text"])
+            self.assertEqual(result["summary"], "Порт Нарвы закрыли после удара по причалу.")
+            self.assertEqual(txt_path.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

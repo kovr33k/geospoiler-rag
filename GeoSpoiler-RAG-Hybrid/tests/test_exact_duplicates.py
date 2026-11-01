@@ -12,6 +12,7 @@ from geospoiler.ingestion.enricher import youtube_pipeline
 from geospoiler.ingestion.enricher.duplicates import post_content_key
 from geospoiler.ingestion.enricher.validator import ValidationResult
 from geospoiler.ingestion.normalizer import youtube_handler
+from geospoiler.ingestion.normalizer.review_queue import apply_reviewed_texts, processed_reviews_for_post
 from geospoiler.retrieval.cards import card_fts
 
 _TEXT = "Длинный пересланный пост о переговорах по Чёрному морю и поставках зерна."
@@ -49,13 +50,46 @@ def _payload() -> LLMPayload:
     )
 
 
-def _write_post(root: Path, channel: str, message_id: int, **meta) -> None:
+def _write_post(root: Path, channel: str, message_id: int, *, channel_name: str | None = None, **meta) -> None:
     directory = root / "normalized" / channel
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{message_id}.txt").write_text(_text(channel, message_id), encoding="utf-8")
     (directory / f"{message_id}.meta.json").write_text(
-        json.dumps(_meta(channel, message_id, **meta), ensure_ascii=False), encoding="utf-8",
+        json.dumps(_meta(channel_name or channel, message_id, **meta), ensure_ascii=False), encoding="utf-8",
     )
+
+
+def _write_review(root: Path, filename: str, channel: str, message_id: int, extracted: str, *, status: str) -> None:
+    queue = root / "review_queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    (queue / filename).write_text(json.dumps({
+        "review_type": "external_link",
+        "channel": channel,
+        "message_id": message_id,
+        "status": status,
+        "extracted_text": extracted,
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+_REVIEW_FACT = "Порт Нарвы закрыли после удара по причалу и остановили движение судов."
+
+
+def _reviewed_payload() -> LLMPayload:
+    return LLMPayload(
+        summary="Ревью сообщает, что порт Нарвы закрыли.",
+        key_points=[{
+            "text": "Порт Нарвы закрыли после удара.",
+            "type": "reported_statement",
+            "importance": "high",
+            "evidence": _REVIEW_FACT,
+        }],
+    )
+
+
+def _payload_for(preprocessed, *_args, **_kwargs) -> LLMPayload:
+    if _REVIEW_FACT in preprocessed.clean_text:
+        return _reviewed_payload()
+    return _payload()
 
 
 @pytest.fixture
@@ -139,6 +173,62 @@ def test_copy_of_a_post_reuses_the_root_card_without_llm(corpus):
     )
     assert "  B https://t.me/c/102/2 — копия: A https://t.me/c/101/1" in rendered
     assert "явных дублей: 1 (постов 1, видео 0)" in rendered
+
+
+def test_reviewed_facts_are_not_discarded_by_duplicate_reuse(corpus):
+    shared = {"web_urls": ["https://example.test/post"]}
+    # B is the earliest card. Without the exclusion it would become the root.
+    _write_post(corpus, "A", 2, **shared)
+    _write_post(corpus, "B", 1, channel_name="B/extra", **shared)
+    _write_post(corpus, "D", 3, **shared)
+    # A pending review is not applied and must not stop an ordinary copy.
+    _write_review(corpus, "D_3_pending.json", "D", 3, "Черновик ревью не отменяет дубль.", status="pending")
+
+    first, extract = _enrich(patch.object(enricher_pipeline, "_extract_payload", side_effect=_payload_for))
+
+    assert extract.call_count == 1
+    assert first.enriched == 3 and first.duplicates == 2
+    root = _card(corpus, "A", 2)
+    assert root["duplicate_of"] is None
+    assert root["provenance"]["source_id"] == "telegram:102:2"
+    assert _card(corpus, "B", 1)["duplicate_of"] == root["provenance"]["source_id"]
+    assert _card(corpus, "D", 3)["duplicate_of"] == root["provenance"]["source_id"]
+
+    # One paragraph, so the whole review block starts with "[" and the key ignores it.
+    _write_review(corpus, "B_extra_1_external.json", "B/extra", 1, _REVIEW_FACT, status="processed")
+    raw_b = (corpus / "normalized" / "B" / "1.txt").read_text(encoding="utf-8")
+    reviewed_b = apply_reviewed_texts(raw_b, processed_reviews_for_post("B/extra", 1))
+    assert _REVIEW_FACT in reviewed_b
+    assert "[Текст из ревью:" in reviewed_b
+    meta_a = NormalizedMeta.model_validate(_meta("A", 2, **shared))
+    meta_b = NormalizedMeta.model_validate(_meta("B/extra", 1, **shared))
+    assert post_content_key(meta_a, _text("A", 2)) == post_content_key(meta_b, reviewed_b)
+
+    second, extract = _enrich(patch.object(enricher_pipeline, "_extract_payload", side_effect=_payload_for))
+
+    assert extract.call_count == 1
+    assert second.enriched == 1 and second.duplicates == 0 and second.skipped_up_to_date == 2
+    reviewed = _card(corpus, "B", 1)
+    assert reviewed["duplicate_of"] is None
+    assert reviewed["summary"] == "Ревью сообщает, что порт Нарвы закрыли."
+    assert reviewed["summary"] != root["summary"]
+    assert _card(corpus, "A", 2)["summary"] == root["summary"]
+    assert _card(corpus, "A", 2)["duplicate_of"] is None
+    assert _card(corpus, "D", 3)["duplicate_of"] == root["provenance"]["source_id"]
+    assert _card(corpus, "D", 3)["summary"] == root["summary"]
+
+    indexed = {record.source_id for record in card_fts.iter_card_records(corpus / "enriched")}
+    assert indexed == {"telegram:102:2", "telegram:101:1"}
+    listed = {item["source_id"] for item in ingest_report.collect_exact_duplicates()}
+    assert listed == {"telegram:103:3"}
+
+    # Loading must not adopt the reviewed card as the root or mark it as a copy.
+    roots = enricher_pipeline._load_duplicate_roots()
+    key = post_content_key(meta_a, _text("A", 2))
+    assert roots.get(key)["provenance"]["source_id"] == "telegram:102:2"
+    assert _card(corpus, "B", 1)["duplicate_of"] is None
+    assert _card(corpus, "A", 2)["duplicate_of"] is None
+    assert _card(corpus, "D", 3)["duplicate_of"] == "telegram:102:2"
 
 
 def test_existing_copies_are_marked_and_stale_marks_cleared(corpus):
