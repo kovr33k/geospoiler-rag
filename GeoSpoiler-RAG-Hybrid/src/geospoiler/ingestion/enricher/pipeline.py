@@ -1209,15 +1209,16 @@ def _source_fingerprint(txt_path: Path, meta_path: Path) -> str:
     existing archive is not regenerated.
     """
     digest = hashlib.sha256()
-    meta_bytes = b""
     for label, path in ((b"text", txt_path), (b"meta", meta_path)):
         data = path.read_bytes()
-        if path == meta_path:
-            meta_bytes = data
         digest.update(label)
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
-    review_digest = _applicable_review_digest(txt_path, meta_bytes)
+    try:
+        channel_name = json.loads(meta_path.read_bytes()).get("channel_name")
+    except (UnicodeError, json.JSONDecodeError, AttributeError):
+        channel_name = None
+    review_digest = _applicable_review_digest(txt_path, channel_name)
     if review_digest is not None:
         digest.update(b"reviews")
         digest.update(len(review_digest).to_bytes(8, "big"))
@@ -1225,32 +1226,19 @@ def _source_fingerprint(txt_path: Path, meta_path: Path) -> str:
     return digest.hexdigest()
 
 
-def _post_channel_name(
-    txt_path: Path,
-    *,
-    meta_name: str | None = None,
-    meta_bytes: bytes | None = None,
-) -> str:
+def _post_channel_name(txt_path: Path, meta_name: str | None = None) -> str:
     """Channel stored on a review item.
 
     Directory names replace characters such as ``/``. The review JSON keeps
     the original ``channel_name`` and lookups must use that same string.
     """
-    if meta_name is None and meta_bytes is not None:
-        try:
-            parsed = json.loads(meta_bytes)
-        except (UnicodeError, json.JSONDecodeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            meta_name = parsed.get("channel_name")
-    name = str(meta_name or "").strip()
-    return name or txt_path.parent.name
+    return str(meta_name or "").strip() or txt_path.parent.name
 
 
-def _applicable_review_digest(txt_path: Path, meta_bytes: bytes) -> bytes | None:
+def _applicable_review_digest(txt_path: Path, meta_name: str | None) -> bytes | None:
     """Stable digest of (file name, extracted_text) for one normalized post."""
     items = processed_reviews_for_post(
-        _post_channel_name(txt_path, meta_bytes=meta_bytes),
+        _post_channel_name(txt_path, meta_name),
         txt_path.stem,
     )
     if not items:

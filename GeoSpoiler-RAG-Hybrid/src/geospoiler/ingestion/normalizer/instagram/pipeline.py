@@ -131,12 +131,10 @@ def extract_instagram_text(
                 if post_id and not _is_review_queue_placeholder(result):
                     _write_cache(post_id, result)
                 return result
-            return _finish_media_failure(
+            if not queue_failures and caption.strip():
+                return _caption_only(canonical_url, info, caption, uploader, is_reel)
+            return _queue_instagram_extraction_failure(
                 canonical_url,
-                info,
-                caption,
-                uploader,
-                is_reel,
                 channel_name=channel_name,
                 message_id=message_id,
                 message_text=message_text,
@@ -153,12 +151,10 @@ def extract_instagram_text(
                 if post_id:
                     _write_cache(post_id, result)
                 return result
-            return _finish_media_failure(
+            if not queue_failures and caption.strip():
+                return _caption_only(canonical_url, info, caption, uploader, is_reel)
+            return _queue_instagram_extraction_failure(
                 canonical_url,
-                info,
-                caption,
-                uploader,
-                is_reel,
                 channel_name=channel_name,
                 message_id=message_id,
                 message_text=message_text,
@@ -173,40 +169,6 @@ def extract_instagram_text(
     if post_id and not config.INSTAGRAM_DEEP_EXTRACT_ENABLED:
         _write_cache(post_id, result)
     return result
-
-
-def _finish_media_failure(
-    url: str,
-    info: dict,
-    caption: str,
-    uploader: str,
-    is_reel: bool,
-    *,
-    channel_name: str,
-    message_id: int,
-    message_text: str,
-    message_date: datetime | None,
-    reason: str,
-    post_type: str = "Reel",
-    queue_failures: bool = True,
-) -> str:
-    """Queue a media failure, or give the reviewer the caption alone.
-
-    The pipeline (queue_failures=True) is unchanged. The reviewer does not
-    cache this caption: the images or the reel were not extracted.
-    """
-    if not queue_failures and caption.strip():
-        return _caption_only(url, info, caption, uploader, is_reel)
-    return _queue_instagram_extraction_failure(
-        url,
-        channel_name=channel_name,
-        message_id=message_id,
-        message_text=message_text,
-        message_date=message_date,
-        reason=reason,
-        post_type=post_type,
-        queue_failures=queue_failures,
-    )
 
 
 def _queue_instagram_extraction_failure(

@@ -44,31 +44,21 @@ def _telegram_embed_url(url: str) -> str:
     )
 
 
-def _is_timeout(exc: BaseException) -> bool:
-    if isinstance(exc, TimeoutError):
-        return True
-    if "timeout" in type(exc).__name__.casefold():
-        return True
-    return "timeout" in str(exc).casefold()
-
-
 async def _crawl_page(crawler, crawl_url: str):
-    """Wait for scripts first. One default retry covers a timeout or a failed run."""
+    """Wait for scripts first. Any failure retries once with crawl4ai defaults."""
     try:
         result = await crawler.arun(url=crawl_url, config=_SCRIPT_WAIT)
+        if result.success:
+            return result
+        detail = result.error_message
     except Exception as exc:
-        if not _is_timeout(exc):
-            raise
-        logger.warning("Crawl4AI timed out for %s; retrying with defaults", crawl_url)
-        return await crawler.arun(url=crawl_url)
-    if not result.success:
-        logger.warning(
-            "Crawl4AI failed for %s: %s; retrying with defaults",
-            crawl_url,
-            result.error_message,
-        )
-        return await crawler.arun(url=crawl_url)
-    return result
+        detail = exc
+    logger.warning(
+        "Crawl4AI failed for %s: %s; retrying with defaults",
+        crawl_url,
+        detail,
+    )
+    return await crawler.arun(url=crawl_url)
 
 
 async def extract_web_text(url: str) -> str:

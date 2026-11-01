@@ -86,10 +86,14 @@ class WebHandlerTests(unittest.TestCase):
         self.assertEqual(given_up, f"[Веб: {url}]\n[Содержание не удалось извлечь]")
         self.assertEqual(len(still_failed.calls), 2)
 
-        other_error = _Crawler([RuntimeError("connection reset")])
+        other_error = _Crawler([
+            RuntimeError("connection reset"),
+            RuntimeError("connection reset"),
+        ])
         errored = _run(other_error, url)
         self.assertEqual(errored, f"[Веб: {url} — ошибка обработки]")
-        self.assertEqual(len(other_error.calls), 1)
+        self.assertEqual(len(other_error.calls), 2)
+        self.assertIsNone(other_error.calls[1][1])
 
     def test_public_telegram_post_is_crawled_as_an_embed(self):
         original = "https://t.me/narva_news/42"

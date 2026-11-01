@@ -265,36 +265,17 @@ _BRACKET_HEADER_LINE = re.compile(r"^\[[^\]\n]*\]$")
 # Automatic downloads only. A short note typed by hand is still allowed.
 _MIN_AUTOMATIC_DOWNLOAD_LETTERS = 150
 _LOGIN_WALL_LETTER_LIMIT = 600
-# "войти" and "вход в" are ordinary news verbs, not a login control.
-_LOGIN_WALL_PHRASES = (
-    "log in",
-    "sign in",
-    "sign up",
-    "загружается...",
-)
+# Ordinary news verbs are not a login control. Applied to casefolded text.
+_LOGIN_WALL_RE = re.compile(r"\b(?:log in|sign in|sign up)\b|загружается\.\.\.")
 # Author, title, and URL lines from youtube_handler._format_youtube_header.
 _YOUTUBE_META_LINE = re.compile(r"^(?:Автор|Название|URL):")
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 
 
-def _login_phrase_pattern(phrase: str) -> str:
-    """Match a login phrase as a whole word or phrase. ``\\w`` stays Unicode-aware."""
-    folded = phrase.casefold()
-    start = r"\b" if folded[:1].isalnum() else r"(?<!\w)"
-    end = r"\b" if folded[-1:].isalnum() else r"(?!\w)"
-    return start + re.escape(folded) + end
-
-
-_LOGIN_WALL_RE = re.compile("|".join(_login_phrase_pattern(phrase) for phrase in _LOGIN_WALL_PHRASES))
-
-
 def _review_record_key(item: dict) -> str:
     """Stable per-record key. A list index moves when the filter or queue changes."""
-    name = Path(str(item.get("_filepath") or "")).name
-    if name:
-        return name
-    return f"{item.get('channel', '')}_{item.get('message_id', '')}"
+    return Path(item["_filepath"]).name
 
 
 _DRAFT_KEY_PREFIXES = ("text_", "prompt_", "source_", "clean_prompt_", "editing_")
@@ -347,14 +328,6 @@ def _comparison_text(text: str) -> str:
     return _collapse_whitespace(_substantive_download_text(text)).casefold()
 
 
-def _same_as_post_text(text: str, message_text: str) -> bool:
-    if _collapse_whitespace(text) == _collapse_whitespace(message_text):
-        return True
-    stripped = _comparison_text(text)
-    post = _comparison_text(message_text)
-    return bool(stripped) and stripped == post
-
-
 def _near_copy_of_post(text: str, message_text: str) -> bool:
     """True when the candidate is the post text or a trivial edit of it.
 
@@ -395,7 +368,7 @@ def validate_review_text(text: str, message_text: str = "") -> str | None:
     if not stripped:
         return "Текст пустой. Нажмите «Пропустить», если извлекать нечего."
     message = str(message_text or "")
-    if _same_as_post_text(stripped, message) or _near_copy_of_post(stripped, message):
+    if _near_copy_of_post(stripped, message):
         return (
             "Нельзя сохранить текст самого поста. Извлеките текст источника "
             "или нажмите «Пропустить»."
@@ -451,14 +424,20 @@ def _extract_source_text_for_prompt(item: dict) -> tuple[str, str]:
     url = str(item.get("url") or "").strip()
     source_kind = _source_kind_for_url(url)
 
-    if source_kind == "youtube":
-        text = _extract_youtube_source(url)
-    elif source_kind == "instagram":
-        text = _extract_instagram_source(item)
-    elif source_kind == "web":
-        text = _extract_web_source(url)
-    else:
-        return str(item.get("message_text") or ""), source_kind
+    try:
+        if source_kind == "youtube":
+            text = _extract_youtube_source(url)
+        elif source_kind == "instagram":
+            text = _extract_instagram_source(item)
+        elif source_kind == "web":
+            text = _extract_web_source(url)
+        else:
+            return str(item.get("message_text") or ""), source_kind
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось извлечь текст из источника {url}. {exc}"
+        ) from exc
+    text = _reject_failed_extraction(text, url)
     error = download_quality_error(text, url)
     if error:
         raise RuntimeError(error)
@@ -517,13 +496,7 @@ def _prompt_for_save(session_state, record_key: str, prompt_text: str) -> str:
 def _extract_youtube_source(url: str) -> str:
     from geospoiler.ingestion.normalizer.youtube_handler import extract_youtube_text
 
-    try:
-        text = extract_youtube_text(url)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Не удалось извлечь текст из источника {url}. {exc}"
-        ) from exc
-    return _reject_failed_extraction(text, url)
+    return extract_youtube_text(url)
 
 
 def _extract_instagram_source(item: dict) -> str:
@@ -535,20 +508,14 @@ def _extract_instagram_source(item: dict) -> str:
     except (TypeError, ValueError):
         message_id = 0
 
-    try:
-        text = extract_instagram_text(
-            url,
-            channel_name=str(item.get("channel") or "reviewer"),
-            message_id=message_id,
-            message_text=str(item.get("message_text") or ""),
-            message_date=_parse_message_datetime(item.get("message_date")),
-            queue_failures=False,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Не удалось извлечь текст из источника {url}. {exc}"
-        ) from exc
-    return _reject_failed_extraction(text, url)
+    return extract_instagram_text(
+        url,
+        channel_name=str(item.get("channel") or "reviewer"),
+        message_id=message_id,
+        message_text=str(item.get("message_text") or ""),
+        message_date=_parse_message_datetime(item.get("message_date")),
+        queue_failures=False,
+    )
 
 
 def _extract_web_source(url: str) -> str:
@@ -556,13 +523,7 @@ def _extract_web_source(url: str) -> str:
 
     from geospoiler.ingestion.normalizer.web_handler import extract_web_text
 
-    try:
-        text = asyncio.run(extract_web_text(url))
-    except Exception as exc:
-        raise RuntimeError(
-            f"Не удалось извлечь текст из источника {url}. {exc}"
-        ) from exc
-    return _reject_failed_extraction(text, url)
+    return asyncio.run(extract_web_text(url))
 
 
 def _approve_review_item(item: dict) -> str | None:
@@ -895,10 +856,7 @@ def _render_review_card(item: dict):
 
     with col2:
         if st.button("✅ Одобрить", key=f"approve_{record_key}", use_container_width=True):
-            if str(url or "").strip():
-                with st.spinner("Загрузка и разбор источника..."):
-                    error = _approve_review_item(item)
-            else:
+            with st.spinner("Загрузка и разбор источника..."):
                 error = _approve_review_item(item)
             if error:
                 st.error(error)

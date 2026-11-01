@@ -56,7 +56,7 @@ def _instagram_cookies_args() -> list[str]:
     A set-but-missing file logs one warning with the path only, then extraction
     continues without cookies.
     """
-    configured = getattr(config, "INSTAGRAM_COOKIES_FILE", None)
+    configured = config.INSTAGRAM_COOKIES_FILE
     if not configured:
         return []
     path = Path(configured)
@@ -107,14 +107,6 @@ def _ytdlp_json_objects(stdout: str) -> list[dict]:
         if isinstance(value, dict):
             objects.append(value)
     return objects
-
-
-def _preferred_ytdlp_info(objects: list[dict]) -> dict:
-    """First object with a description or title, otherwise the first object."""
-    for obj in objects:
-        if obj.get("description") or obj.get("title"):
-            return obj
-    return objects[0]
 
 
 def check_ytdlp_version(*, force: bool = False) -> dict[str, str]:
@@ -284,7 +276,7 @@ def _get_info_ytdlp(url: str) -> dict | None:
                     url,
                     result.returncode,
                 )
-            return _preferred_ytdlp_info(objects)
+            return next((o for o in objects if o.get("description") or o.get("title")), objects[0])
         if result.returncode == 0 and (result.stdout or "").strip():
             logger.warning("yt-dlp returned invalid JSON for %s", url)
             return None

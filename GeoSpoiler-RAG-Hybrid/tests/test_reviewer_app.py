@@ -473,7 +473,7 @@ class ReviewerAppTests(unittest.TestCase):
             return_value=f"[YouTube: не удалось получить информацию — {url}]",
         ):
             with self.assertRaises(RuntimeError) as caught:
-                reviewer_app._extract_youtube_source(url)
+                reviewer_app._extract_source_text_for_prompt({"url": url})
 
         self.assertIn(url, str(caught.exception))
         self.assertNotIn("не удалось получить информацию", str(caught.exception))
