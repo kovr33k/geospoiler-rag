@@ -7,6 +7,7 @@ from datetime import datetime
 from geospoiler import config
 from geospoiler.ingestion.normalizer.instagram.audio import _extract_audio, _transcribe_audio
 from geospoiler.ingestion.normalizer.instagram.builder import (
+    InstagramExtractionError,
     _caption_only,
     _queue_long_reel_for_review,
     build_carousel_text,
@@ -62,10 +63,14 @@ def extract_instagram_text(
     message_id: int = 0,
     message_text: str = "",
     message_date: datetime | None = None,
+    queue_failures: bool = True,
 ) -> str:
     """
     Extract text content from an Instagram post/Reel.
     Returns formatted text with caption, transcription, OCR, and summary.
+
+    queue_failures=False raises InstagramExtractionError instead of writing
+    a review-queue item. The normal pipeline keeps the default.
     """
     canonical_url = canonicalize_instagram_url(url)
     post_id = _extract_post_id(canonical_url)
@@ -96,6 +101,7 @@ def extract_instagram_text(
                 "Instagram media metadata unavailable to yt-dlp; the page may still be "
                 "visible in a browser (empty media response or extractor access block)"
             ),
+            queue_failures=queue_failures,
         )
 
     caption = (info.get("description") or info.get("title") or "").strip()
@@ -116,6 +122,7 @@ def extract_instagram_text(
                 message_id=message_id,
                 message_text=message_text,
                 message_date=message_date,
+                queue_failures=queue_failures,
             )
             if result and (
                 _is_review_queue_placeholder(result)
@@ -124,13 +131,18 @@ def extract_instagram_text(
                 if post_id and not _is_review_queue_placeholder(result):
                     _write_cache(post_id, result)
                 return result
-            return _queue_instagram_extraction_failure(
+            return _finish_media_failure(
                 canonical_url,
+                info,
+                caption,
+                uploader,
+                is_reel,
                 channel_name=channel_name,
                 message_id=message_id,
                 message_text=message_text,
                 message_date=message_date,
                 reason=REEL_MEDIA_FAILURE_REASON,
+                queue_failures=queue_failures,
             )
         else:
             result = _deep_extract_carousel(canonical_url, info, caption, uploader)
@@ -141,14 +153,19 @@ def extract_instagram_text(
                 if post_id:
                     _write_cache(post_id, result)
                 return result
-            return _queue_instagram_extraction_failure(
+            return _finish_media_failure(
                 canonical_url,
+                info,
+                caption,
+                uploader,
+                is_reel,
                 channel_name=channel_name,
                 message_id=message_id,
                 message_text=message_text,
                 message_date=message_date,
                 reason=CAROUSEL_MEDIA_FAILURE_REASON,
                 post_type="Post",
+                queue_failures=queue_failures,
             )
 
     # Fallback: caption-only (original behavior)
@@ -156,6 +173,40 @@ def extract_instagram_text(
     if post_id and not config.INSTAGRAM_DEEP_EXTRACT_ENABLED:
         _write_cache(post_id, result)
     return result
+
+
+def _finish_media_failure(
+    url: str,
+    info: dict,
+    caption: str,
+    uploader: str,
+    is_reel: bool,
+    *,
+    channel_name: str,
+    message_id: int,
+    message_text: str,
+    message_date: datetime | None,
+    reason: str,
+    post_type: str = "Reel",
+    queue_failures: bool = True,
+) -> str:
+    """Queue a media failure, or give the reviewer the caption alone.
+
+    The pipeline (queue_failures=True) is unchanged. The reviewer does not
+    cache this caption: the images or the reel were not extracted.
+    """
+    if not queue_failures and caption.strip():
+        return _caption_only(url, info, caption, uploader, is_reel)
+    return _queue_instagram_extraction_failure(
+        url,
+        channel_name=channel_name,
+        message_id=message_id,
+        message_text=message_text,
+        message_date=message_date,
+        reason=reason,
+        post_type=post_type,
+        queue_failures=queue_failures,
+    )
 
 
 def _queue_instagram_extraction_failure(
@@ -167,8 +218,11 @@ def _queue_instagram_extraction_failure(
     message_date: datetime | None,
     reason: str,
     post_type: str = "Reel",
+    queue_failures: bool = True,
 ) -> str:
     """Make source-access failures visible without pretending caption-only success."""
+    if not queue_failures:
+        raise InstagramExtractionError(reason)
     review = queue_review_item(
         review_type=REVIEW_TYPE_EXTERNAL_LINK,
         channel_name=channel_name,
@@ -192,6 +246,7 @@ def _deep_extract_reel(
     message_id: int,
     message_text: str,
     message_date: datetime | None,
+    queue_failures: bool = True,
 ) -> str | None:
     """Full pipeline: video → audio transcription + frame OCR → LLM summary."""
 
@@ -210,6 +265,7 @@ def _deep_extract_reel(
             message_id=message_id,
             message_text=message_text,
             message_date=message_date,
+            queue_failures=queue_failures,
         )
 
     work_dir = config.MEDIA_CACHE_DIR / "instagram_work"
@@ -409,6 +465,7 @@ __all__ = [
     "_get_info_ytdlp",
     "_get_subtitles_from_info",
     "_hamming_distance",
+    "InstagramExtractionError",
     "_is_review_queue_placeholder",
     "_ocr_frames_batched",
     "_ocr_single_batch",

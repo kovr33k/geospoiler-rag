@@ -8,9 +8,11 @@ Or automatically via:
     python main.py review --web
 """
 
+import difflib
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime
 from html import escape as escape_html_attribute
 from pathlib import Path
@@ -23,12 +25,14 @@ from geospoiler import config  # noqa: E402
 
 # Add project root to path so config can be imported
 from geospoiler.config import PROJECT_ROOT as PROJECT_ROOT
+from geospoiler.ingestion.normalizer.media_selection import strip_url_tokens
 from geospoiler.ingestion.normalizer.review_queue import (
     REVIEW_TYPE_AI_CHAT,
     REVIEW_TYPE_EXTERNAL_LINK,
     REVIEW_TYPE_INSTAGRAM_LONG_REEL,
     REVIEW_TYPE_UNINFORMATIVE,
     mark_reviewed,
+    reopen_review,
 )
 from geospoiler.ingestion.normalizer.translator import _deepseek_v4_options  # noqa: E402
 from geospoiler.providers import llm_backend  # noqa: E402
@@ -248,6 +252,175 @@ def _format_review_reason(reason: str) -> str:
 
 PROMPT_SOURCE_CHAR_LIMIT = 24000
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+|www\.[^\s<>\"]+", re.IGNORECASE)
+# Failure strings the downloaders return instead of source text. One list so
+# save, approve, and extraction all reject the same markers.
+_EXTRACTION_FAILURE_MARKERS = (
+    "Содержание не удалось извлечь",
+    "— ошибка обработки",
+    "[YouTube: не удалось",
+    "Отправлено в очередь на ручной просмотр",
+    "Уже обработано:",
+)
+_BRACKET_HEADER_LINE = re.compile(r"^\[[^\]\n]*\]$")
+# Automatic downloads only. A short note typed by hand is still allowed.
+_MIN_AUTOMATIC_DOWNLOAD_LETTERS = 150
+_LOGIN_WALL_LETTER_LIMIT = 600
+# "войти" and "вход в" are ordinary news verbs, not a login control.
+_LOGIN_WALL_PHRASES = (
+    "log in",
+    "sign in",
+    "sign up",
+    "загружается...",
+)
+# Author, title, and URL lines from youtube_handler._format_youtube_header.
+_YOUTUBE_META_LINE = re.compile(r"^(?:Автор|Название|URL):")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+
+
+def _login_phrase_pattern(phrase: str) -> str:
+    """Match a login phrase as a whole word or phrase. ``\\w`` stays Unicode-aware."""
+    folded = phrase.casefold()
+    start = r"\b" if folded[:1].isalnum() else r"(?<!\w)"
+    end = r"\b" if folded[-1:].isalnum() else r"(?!\w)"
+    return start + re.escape(folded) + end
+
+
+_LOGIN_WALL_RE = re.compile("|".join(_login_phrase_pattern(phrase) for phrase in _LOGIN_WALL_PHRASES))
+
+
+def _review_record_key(item: dict) -> str:
+    """Stable per-record key. A list index moves when the filter or queue changes."""
+    name = Path(str(item.get("_filepath") or "")).name
+    if name:
+        return name
+    return f"{item.get('channel', '')}_{item.get('message_id', '')}"
+
+
+_DRAFT_KEY_PREFIXES = ("text_", "prompt_", "source_", "clean_prompt_", "editing_")
+
+
+def _clear_review_draft(session_state, record_key: str) -> None:
+    """Drop one record's draft. Call before rerun, after the action succeeded."""
+    for prefix in _DRAFT_KEY_PREFIXES:
+        session_state.pop(f"{prefix}{record_key}", None)
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _failure_marker(text: str) -> str | None:
+    for marker in _EXTRACTION_FAILURE_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
+def _is_bracket_header_only(text: str) -> bool:
+    """True when every non-empty line is a bracketed header such as ``[Веб: url]``."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return bool(lines) and all(_BRACKET_HEADER_LINE.fullmatch(line) for line in lines)
+
+
+def _substantive_download_text(text: str) -> str:
+    """Text for copy checks and download quality.
+
+    A line that is only ``[...]`` is an extractor header or a status line.
+    YouTube also emits unbracketed author, title, and URL lines. Links and
+    format characters are removed as well.
+    """
+    lines = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if _BRACKET_HEADER_LINE.fullmatch(stripped) or _YOUTUBE_META_LINE.match(stripped):
+            continue
+        lines.append(line)
+    body = "\n".join(lines)
+    body = _MARKDOWN_IMAGE_RE.sub(" ", body)
+    body = _MARKDOWN_LINK_RE.sub(r"\1", body)
+    body = strip_url_tokens(body)
+    return "".join(char for char in body if unicodedata.category(char) != "Cf")
+
+
+def _comparison_text(text: str) -> str:
+    return _collapse_whitespace(_substantive_download_text(text)).casefold()
+
+
+def _same_as_post_text(text: str, message_text: str) -> bool:
+    if _collapse_whitespace(text) == _collapse_whitespace(message_text):
+        return True
+    stripped = _comparison_text(text)
+    post = _comparison_text(message_text)
+    return bool(stripped) and stripped == post
+
+
+def _near_copy_of_post(text: str, message_text: str) -> bool:
+    """True when the candidate is the post text or a trivial edit of it.
+
+    Headers and status lines are removed first. An empty post does not reject
+    anything: there is nothing to copy. A longer extraction that only quotes
+    the post stays. autojunk is off: frequent letters are real anchors.
+    """
+    post = _comparison_text(message_text)
+    if not post:
+        return False
+    candidate = _comparison_text(text)
+    if not candidate:
+        return False
+    if candidate in post:
+        return True
+    return difflib.SequenceMatcher(None, candidate, post, autojunk=False).ratio() >= 0.9
+
+
+def download_quality_error(text: str, url: str) -> str | None:
+    """Reject a thin automatic download. Hand-typed text does not use this."""
+    substantive = _substantive_download_text(text)
+    letters = sum(char.isalpha() for char in substantive)
+    folded = substantive.casefold()
+    login_wall = _LOGIN_WALL_RE.search(folded) is not None
+    if letters < _MIN_AUTOMATIC_DOWNLOAD_LETTERS or (
+        letters < _LOGIN_WALL_LETTER_LIMIT and login_wall
+    ):
+        return (
+            "Страница почти без текста — вероятно, нужен вход "
+            f"или страница грузится скриптом: {url}"
+        )
+    return None
+
+
+def validate_review_text(text: str, message_text: str = "") -> str | None:
+    """Return a Russian error when the text must not be saved, else None."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return "Текст пустой. Нажмите «Пропустить», если извлекать нечего."
+    message = str(message_text or "")
+    if _same_as_post_text(stripped, message) or _near_copy_of_post(stripped, message):
+        return (
+            "Нельзя сохранить текст самого поста. Извлеките текст источника "
+            "или нажмите «Пропустить»."
+        )
+    if not any(char.isalpha() or char.isdigit() for char in strip_url_tokens(stripped)):
+        return (
+            "После удаления ссылок в тексте не осталось букв или цифр. "
+            "Вставьте текст источника или нажмите «Пропустить»."
+        )
+    if _failure_marker(stripped) or _is_bracket_header_only(stripped):
+        return (
+            "Это служебное сообщение об ошибке загрузки, а не текст источника. "
+            "Исправьте текст или нажмите «Пропустить»."
+        )
+    return None
+
+
+def _reject_failed_extraction(text: str, url: str) -> str:
+    """Raise when a downloader returned a failure marker instead of source text."""
+    if _failure_marker(text) or _is_bracket_header_only(str(text or "").strip()):
+        raise RuntimeError(
+            f"Не удалось извлечь текст из источника {url}. "
+            "Загрузка вернула сообщение об ошибке."
+        )
+    return text
 
 
 def _source_kind_for_url(url: str) -> str:
@@ -279,12 +452,17 @@ def _extract_source_text_for_prompt(item: dict) -> tuple[str, str]:
     source_kind = _source_kind_for_url(url)
 
     if source_kind == "youtube":
-        return _extract_youtube_source(url), source_kind
-    if source_kind == "instagram":
-        return _extract_instagram_source(item), source_kind
-    if source_kind == "web":
-        return _extract_web_source(url), source_kind
-    return str(item.get("message_text") or ""), source_kind
+        text = _extract_youtube_source(url)
+    elif source_kind == "instagram":
+        text = _extract_instagram_source(item)
+    elif source_kind == "web":
+        text = _extract_web_source(url)
+    else:
+        return str(item.get("message_text") or ""), source_kind
+    error = download_quality_error(text, url)
+    if error:
+        raise RuntimeError(error)
+    return text, source_kind
 
 
 def _resolve_prompt_extraction_request(
@@ -317,20 +495,20 @@ def _extract_url_from_instruction(instruction: str) -> tuple[str | None, str]:
 
 def _remember_prompt_extraction_result(
     session_state,
-    idx: int,
+    record_key: str,
     *,
     extracted: str,
     extraction_source: str,
     clean_prompt: str,
 ) -> None:
-    session_state[f"text_{idx}"] = extracted
-    session_state[f"source_{idx}"] = extraction_source
-    session_state[f"clean_prompt_{idx}"] = clean_prompt
+    session_state[f"text_{record_key}"] = extracted
+    session_state[f"source_{record_key}"] = extraction_source
+    session_state[f"clean_prompt_{record_key}"] = clean_prompt
 
 
-def _prompt_for_save(session_state, idx: int, prompt_text: str) -> str:
+def _prompt_for_save(session_state, record_key: str, prompt_text: str) -> str:
     return str(
-        session_state.get(f"clean_prompt_{idx}")
+        session_state.get(f"clean_prompt_{record_key}")
         or prompt_text
         or ""
     ).strip()
@@ -339,24 +517,38 @@ def _prompt_for_save(session_state, idx: int, prompt_text: str) -> str:
 def _extract_youtube_source(url: str) -> str:
     from geospoiler.ingestion.normalizer.youtube_handler import extract_youtube_text
 
-    return extract_youtube_text(url)
+    try:
+        text = extract_youtube_text(url)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось извлечь текст из источника {url}. {exc}"
+        ) from exc
+    return _reject_failed_extraction(text, url)
 
 
 def _extract_instagram_source(item: dict) -> str:
     from geospoiler.ingestion.normalizer.instagram_handler import extract_instagram_text
 
+    url = str(item.get("url") or "")
     try:
         message_id = int(item.get("message_id") or 0)
     except (TypeError, ValueError):
         message_id = 0
 
-    return extract_instagram_text(
-        str(item.get("url") or ""),
-        channel_name=str(item.get("channel") or "reviewer"),
-        message_id=message_id,
-        message_text=str(item.get("message_text") or ""),
-        message_date=_parse_message_datetime(item.get("message_date")),
-    )
+    try:
+        text = extract_instagram_text(
+            url,
+            channel_name=str(item.get("channel") or "reviewer"),
+            message_id=message_id,
+            message_text=str(item.get("message_text") or ""),
+            message_date=_parse_message_datetime(item.get("message_date")),
+            queue_failures=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось извлечь текст из источника {url}. {exc}"
+        ) from exc
+    return _reject_failed_extraction(text, url)
 
 
 def _extract_web_source(url: str) -> str:
@@ -364,7 +556,36 @@ def _extract_web_source(url: str) -> str:
 
     from geospoiler.ingestion.normalizer.web_handler import extract_web_text
 
-    return asyncio.run(extract_web_text(url))
+    try:
+        text = asyncio.run(extract_web_text(url))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось извлечь текст из источника {url}. {exc}"
+        ) from exc
+    return _reject_failed_extraction(text, url)
+
+
+def _approve_review_item(item: dict) -> str | None:
+    """Download a source and save it. Return a Russian error, or None on success."""
+    url = str(item.get("url") or "").strip()
+    if not url:
+        return (
+            "У записи нет ссылки на источник. Введите текст через «Редактировать» "
+            "или нажмите «Пропустить»."
+        )
+    try:
+        extracted, extraction_source = _extract_source_text_for_prompt(item)
+    except Exception as exc:
+        return str(exc)
+    error = validate_review_text(extracted, str(item.get("message_text") or ""))
+    if error:
+        return error
+    mark_reviewed(
+        str(item.get("_filepath") or ""),
+        extracted_text=extracted.strip(),
+        extraction_source=extraction_source,
+    )
+    return None
 
 
 def _build_prompted_extraction_messages(
@@ -583,11 +804,11 @@ def _render_content_review():
         return
 
     # Render items
-    for idx, item in enumerate(display_items):
-        _render_review_card(item, idx)
+    for item in display_items:
+        _render_review_card(item)
 
 
-def _render_review_card(item: dict, idx: int):
+def _render_review_card(item: dict):
     """Render a single review card with action buttons."""
     review_type = item.get("review_type", "unknown")
     status = item.get("status", "pending")
@@ -598,6 +819,7 @@ def _render_review_card(item: dict, idx: int):
     message_text = item.get("message_text", "")
     message_date = item.get("message_date", "")
     filepath = item.get("_filepath", "")
+    record_key = _review_record_key(item)
 
     # Card header
     badge_html = _get_type_badge_html(review_type)
@@ -623,6 +845,18 @@ def _render_review_card(item: dict, idx: int):
             truncated += "..."
         preview_html = f'<div class="message-preview">{truncated}</div>'
 
+    extracted_html = ""
+    if status == "processed":
+        extracted = str(item.get("extracted_text") or "").strip()
+        if extracted:
+            truncated_extracted = _escape_html(extracted[:500])
+            if len(extracted) > 500:
+                truncated_extracted += "..."
+            extracted_html = (
+                '<div class="message-preview"><strong>Извлечённый текст:</strong><br>'
+                f"{truncated_extracted}</div>"
+            )
+
     st.markdown(
         f'<div class="review-card">'
         f'{badge_html}'
@@ -634,137 +868,176 @@ def _render_review_card(item: dict, idx: int):
         f'{url_html}'
         f'{reason_html}'
         f'{preview_html}'
+        f'{extracted_html}'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # Actions (only for pending items)
-    if status == "pending":
-        col1, col2, col3 = st.columns([1, 1, 2])
+    if status != "pending":
+        if st.button(
+            "↩️ Вернуть в ожидание",
+            key=f"reopen_{record_key}",
+            use_container_width=True,
+        ):
+            reopen_review(filepath)
+            _clear_review_draft(st.session_state, record_key)
+            st.rerun()
+        return
 
-        with col1:
-            if st.button("⏭️ Пропустить", key=f"skip_{idx}", use_container_width=True):
-                mark_reviewed(filepath, skip=True)
+    # Actions for pending items
+    col1, col2, col3 = st.columns([1, 1, 2])
+
+    with col1:
+        if st.button("⏭️ Пропустить", key=f"skip_{record_key}", use_container_width=True):
+            mark_reviewed(filepath, skip=True)
+            _clear_review_draft(st.session_state, record_key)
+            st.rerun()
+
+    with col2:
+        if st.button("✅ Одобрить", key=f"approve_{record_key}", use_container_width=True):
+            if str(url or "").strip():
+                with st.spinner("Загрузка и разбор источника..."):
+                    error = _approve_review_item(item)
+            else:
+                error = _approve_review_item(item)
+            if error:
+                st.error(error)
+            else:
+                _clear_review_draft(st.session_state, record_key)
                 st.rerun()
 
-        with col2:
-            if st.button("✅ Одобрить", key=f"approve_{idx}", use_container_width=True):
-                if review_type == REVIEW_TYPE_UNINFORMATIVE and message_text.strip():
-                    mark_reviewed(filepath, extracted_text=message_text.strip())
-                    st.rerun()
-                else:
-                    st.warning("Для AI-диалога или внешней ссылки сначала добавьте извлечённый текст через редактирование.")
+    with col3:
+        if st.button("✏️ Редактировать", key=f"edit_{record_key}", use_container_width=True):
+            st.session_state[f"editing_{record_key}"] = True
 
-        with col3:
-            if st.button("✏️ Редактировать", key=f"edit_{idx}", use_container_width=True):
-                st.session_state[f"editing_{idx}"] = True
+    # Edit mode. The text area starts empty: the post text is not an extraction.
+    if st.session_state.get(f"editing_{record_key}", False):
+        st.markdown("---")
+        st.markdown("##### ✏️ Ваша версия текста")
 
-        # Edit mode
-        if st.session_state.get(f"editing_{idx}", False):
-            st.markdown("---")
-            st.markdown("##### ✏️ Ваша версия текста")
+        previous = str(item.get("previous_extracted_text") or "").strip()
+        if previous:
+            with st.expander("Предыдущий извлечённый текст"):
+                st.text(previous)
 
-            if url:
-                if st.button("📥 Извлечь весь текст из источника", key=f"auto_{idx}"):
-                    with st.spinner("Загрузка и разбор источника..."):
+        if url:
+            if st.button("📥 Извлечь весь текст из источника", key=f"auto_{record_key}"):
+                with st.spinner("Загрузка и разбор источника..."):
+                    try:
                         extracted, extraction_source = _extract_source_text_for_prompt(item)
-                        st.session_state[f"text_{idx}"] = extracted
-                        st.session_state[f"source_{idx}"] = extraction_source
-                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+                    else:
+                        error = validate_review_text(extracted, message_text)
+                        if error:
+                            st.error(error)
+                        else:
+                            st.session_state[f"text_{record_key}"] = extracted
+                            st.session_state[f"source_{record_key}"] = extraction_source
+                            st.rerun()
 
-            prompt_text = st.text_area(
-                "Инструкция для извлечения:",
-                value=st.session_state.get(
-                    f"prompt_{idx}",
-                    item.get("extraction_prompt") or "",
-                ),
-                height=90,
-                key=f"prompt_{idx}",
-                help=(
-                    "Например: достать из ролика только информацию про тему X, "
-                    "без пересказа всего видео."
-                ),
-            )
+        prompt_text = st.text_area(
+            "Инструкция для извлечения:",
+            value=st.session_state.get(
+                f"prompt_{record_key}",
+                item.get("extraction_prompt") or "",
+            ),
+            height=90,
+            key=f"prompt_{record_key}",
+            help=(
+                "Например: достать из ролика только информацию про тему X, "
+                "без пересказа всего видео."
+            ),
+        )
 
-            if st.button(
-                "🎯 Извлечь по инструкции",
-                key=f"prompt_extract_{idx}",
-                use_container_width=True,
-            ):
-                if not prompt_text.strip():
-                    st.warning("Сначала напишите инструкцию для извлечения.")
-                else:
-                    with st.spinner("Извлекаю источник и применяю инструкцию..."):
-                        try:
-                            source_text, extraction_source, clean_prompt = (
-                                _resolve_prompt_extraction_request(item, prompt_text)
+        if st.button(
+            "🎯 Извлечь по инструкции",
+            key=f"prompt_extract_{record_key}",
+            use_container_width=True,
+        ):
+            if not prompt_text.strip():
+                st.warning("Сначала напишите инструкцию для извлечения.")
+            else:
+                with st.spinner("Извлекаю источник и применяю инструкцию..."):
+                    try:
+                        source_text, extraction_source, clean_prompt = (
+                            _resolve_prompt_extraction_request(item, prompt_text)
+                        )
+                        if not source_text.strip():
+                            st.warning("Не удалось получить исходный материал для извлечения.")
+                        elif not clean_prompt.strip():
+                            st.warning("После ссылки не осталось инструкции для извлечения.")
+                        else:
+                            extracted = _extract_with_prompt(
+                                source_text,
+                                clean_prompt,
+                                extraction_source,
                             )
-                            if not source_text.strip():
-                                st.warning("Не удалось получить исходный материал для извлечения.")
-                            elif not clean_prompt.strip():
-                                st.warning("После ссылки не осталось инструкции для извлечения.")
+                            error = validate_review_text(extracted, message_text)
+                            if error:
+                                st.error(error)
                             else:
-                                extracted = _extract_with_prompt(
-                                    source_text,
-                                    clean_prompt,
-                                    extraction_source,
-                                )
                                 _remember_prompt_extraction_result(
                                     st.session_state,
-                                    idx,
+                                    record_key,
                                     extracted=extracted,
                                     extraction_source=extraction_source,
                                     clean_prompt=clean_prompt,
                                 )
                                 st.rerun()
-                        except Exception as exc:
-                            st.error(f"Не удалось извлечь по инструкции: {exc}")
+                    except Exception as exc:
+                        st.error(f"Не удалось извлечь по инструкции: {exc}")
 
-            edited_text = st.text_area(
-                "Текст:",
-                value=st.session_state.get(f"text_{idx}", message_text or ""),
-                height=200,
-                key=f"text_{idx}",
-                label_visibility="collapsed",
-            )
+        edited_text = st.text_area(
+            "Текст:",
+            value=st.session_state.get(f"text_{record_key}", ""),
+            height=200,
+            key=f"text_{record_key}",
+            label_visibility="collapsed",
+        )
 
-            uploaded_image = st.file_uploader(
-                "📎 Прикрепить изображение (необязательно):",
-                type=["jpg", "jpeg", "png", "webp", "gif"],
-                key=f"img_{idx}",
-            )
+        uploaded_image = st.file_uploader(
+            "📎 Прикрепить изображение (необязательно):",
+            type=["jpg", "jpeg", "png", "webp", "gif"],
+            key=f"img_{record_key}",
+        )
 
-            ecol1, ecol2 = st.columns(2)
-            with ecol1:
-                if st.button("💾 Сохранить", key=f"save_{idx}", use_container_width=True, type="primary"):
+        ecol1, ecol2 = st.columns(2)
+        with ecol1:
+            if st.button("💾 Сохранить", key=f"save_{record_key}", use_container_width=True, type="primary"):
+                error = validate_review_text(edited_text, message_text)
+                if error:
+                    st.error(error)
+                else:
                     img_path = None
                     if uploaded_image:
                         img_path = _save_uploaded_image(item, uploaded_image)
 
+                    extraction_source = st.session_state.get(
+                        f"source_{record_key}",
+                        item.get("extraction_source"),
+                    )
+                    extraction_prompt = _prompt_for_save(
+                        st.session_state,
+                        record_key,
+                        prompt_text,
+                    ) or None
                     mark_reviewed(
                         filepath,
-                        extracted_text=edited_text.strip() if edited_text.strip() else None,
-                        skip=not edited_text.strip(),
+                        extracted_text=edited_text.strip(),
                         attached_image=img_path,
-                        extraction_prompt=_prompt_for_save(
-                            st.session_state,
-                            idx,
-                            prompt_text,
-                        ) or None,
-                        extraction_source=st.session_state.get(
-                            f"source_{idx}",
-                            item.get("extraction_source"),
-                        ),
+                        extraction_prompt=extraction_prompt,
+                        extraction_source=extraction_source,
                     )
-                    st.session_state[f"editing_{idx}"] = False
+                    _clear_review_draft(st.session_state, record_key)
                     st.rerun()
 
-            with ecol2:
-                if st.button("❌ Отмена", key=f"cancel_{idx}", use_container_width=True):
-                    st.session_state[f"editing_{idx}"] = False
-                    st.rerun()
+        with ecol2:
+            if st.button("❌ Отмена", key=f"cancel_{record_key}", use_container_width=True):
+                _clear_review_draft(st.session_state, record_key)
+                st.rerun()
 
-        st.markdown("")  # spacer
+    st.markdown("")  # spacer
 
 
 def _escape_html(text: str) -> str:

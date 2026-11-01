@@ -313,25 +313,20 @@ python main.py review
 python main.py review --web
 ```
 
-To process one item, edit its JSON:
-
-```json
-{
-  "status": "processed",
-  "extracted_text": "..."
-}
-```
-
-Then run:
+Process the queue in the reviewer, then rebuild the affected cards and load them:
 
 ```powershell
+python main.py review --web
+python main.py enrich
 python main.py load
+python main.py ingest-report
 ```
 
-The load step includes all review queue items with `status=processed` and non-empty `extracted_text`.
-Review JSON files are treated as their own stable source paths.
+`python main.py review --web` opens the Streamlit reviewer. «Одобрить» downloads the source and saves the extracted text. «Редактировать» is for text typed by hand or for prompt extraction. The reviewer refuses empty text, the post's own text, a bare link, and download error markers. «Вернуть в ожидание» reopens a processed record. `python main.py enrich` substitutes processed review texts into the post text used for the card and regenerates the affected cards. `python main.py load` loads those cards. `python main.py ingest-report` shows whether anything is still waiting.
 
-Do not edit `data/normalized/*.txt` to paste reviewed external-link text unless you intentionally want to replace the original normalized post. Prefer `python main.py review --web`, which stores reviewed text in the review JSON.
+Set `INSTAGRAM_COOKIES_FILE` to a Netscape cookies file when Instagram metadata requires a logged-in session. Do not commit that file. Web extraction needs the Playwright Chromium build that matches the installed Playwright (`python -m playwright install chromium`).
+
+Do not edit `data/normalized/*.txt` by hand to paste reviewed text. The review JSON is the source of the reviewed text, and normalized files stay as the pipeline wrote them.
 
 ## Query Modes
 

@@ -12,8 +12,17 @@ from fetcher.telegram_client import TelegramMedia  # noqa: E402
 from normalizer.image_handler import _candidate_api_keys, describe_image  # noqa: E402
 from normalizer.instagram import pipeline as instagram_pipeline  # noqa: E402
 from normalizer.instagram.cache import _cache_signature  # noqa: E402
-from normalizer.instagram.downloader import _get_info_ytdlp, check_ytdlp_version  # noqa: E402
+from normalizer.instagram.downloader import (  # noqa: E402
+    _download_carousel_images,
+    _download_video,
+    _get_info_ytdlp,
+    _get_subtitles_from_info,
+    _logged_missing_cookie_files,
+    check_ytdlp_version,
+    installed_ytdlp_version,
+)
 from normalizer.instagram_handler import (  # noqa: E402
+    InstagramExtractionError,
     _compute_edge_density,
     _compute_phash,
     _dedup_frames,
@@ -23,6 +32,7 @@ from normalizer.instagram_handler import (  # noqa: E402
     _read_cache,
     _write_cache,
     canonicalize_instagram_url,
+    extract_instagram_text,
 )
 from normalizer.transcription_handler import _resolve_media_path, transcribe_media  # noqa: E402
 from normalizer.youtube_handler import _clean_description, extract_youtube_text  # noqa: E402
@@ -836,3 +846,274 @@ class InstagramFallbackTests(unittest.TestCase):
             self.assertEqual(payload["message_id"], 42)
             self.assertIn("очеред", result.lower())
             self.assertFalse((cache_dir / "ABC123.json").exists())
+
+
+class InstagramReviewAndCookiesTests(unittest.TestCase):
+    def _metadata(self, stdout: str, returncode: int = 0, stderr: str = ""):
+        return Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_queue_failures_false_raises_without_writing_queue(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review_queue"
+            cache_dir = root / "instagram_cache"
+            queue_dir.mkdir()
+            cache_dir.mkdir()
+            with patch("normalizer.instagram_handler.config.REVIEW_QUEUE_DIR", queue_dir), \
+                 patch("normalizer.instagram_handler.config.INSTAGRAM_CACHE_DIR", cache_dir), \
+                 patch("normalizer.instagram_handler._get_info_ytdlp", return_value=None):
+                with self.assertRaises(InstagramExtractionError):
+                    extract_instagram_text(
+                        "https://www.instagram.com/reel/NOQUEUE1/",
+                        channel_name="Channel",
+                        message_id=77,
+                        message_text="Post text",
+                        queue_failures=False,
+                    )
+
+            self.assertEqual(list(queue_dir.glob("*.json")), [])
+            self.assertFalse((cache_dir / "NOQUEUE1.json").exists())
+
+    def _photo_without_images(self, root: Path, *, queue_failures: bool, caption: str):
+        cache_dir = root / "instagram_cache"
+        queue_dir = root / "review_queue"
+        cache_dir.mkdir()
+        queue_dir.mkdir()
+        info = {
+            "description": caption,
+            "uploader": "user",
+            "duration": 0,
+            "subtitles": {},
+            "automatic_captions": {},
+        }
+        with patch("normalizer.instagram_handler.config.INSTAGRAM_CACHE_DIR", cache_dir):
+            with patch("normalizer.instagram_handler.config.REVIEW_QUEUE_DIR", queue_dir):
+                with patch("normalizer.instagram_handler.config.MEDIA_CACHE_DIR", root):
+                    with patch("normalizer.instagram_handler.config.INSTAGRAM_DEEP_EXTRACT_ENABLED", True):
+                        with patch("normalizer.instagram_handler._get_info_ytdlp", return_value=info):
+                            with patch.object(instagram_pipeline, "_download_carousel_images", return_value=[]):
+                                return extract_instagram_text(
+                                    "https://www.instagram.com/p/PHOTOONLY1/",
+                                    channel_name="Channel",
+                                    message_id=80,
+                                    message_text="Post text",
+                                    queue_failures=queue_failures,
+                                )
+
+    def test_reviewer_photo_without_images_returns_caption_without_cache(self):
+        caption = "Подпись фото про закрытый порт Нарвы и остановку судов у причала."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = self._photo_without_images(root, queue_failures=False, caption=caption)
+
+            self.assertIn(caption, result)
+            self.assertIn("[Instagram Post:", result)
+            self.assertNotIn("[Изображение", result)
+            self.assertNotIn("очеред", result.lower())
+            self.assertEqual(list((root / "review_queue").glob("*.json")), [])
+            self.assertFalse((root / "instagram_cache" / "PHOTOONLY1.json").exists())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaises(InstagramExtractionError):
+                self._photo_without_images(root, queue_failures=False, caption="  ")
+            self.assertEqual(list((root / "review_queue").glob("*.json")), [])
+            self.assertFalse((root / "instagram_cache" / "PHOTOONLY1.json").exists())
+
+    def test_pipeline_photo_without_images_still_queues_the_media_failure(self):
+        caption = "Подпись фото про закрытый порт Нарвы и остановку судов у причала."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = self._photo_without_images(root, queue_failures=True, caption=caption)
+
+            queued = list((root / "review_queue").glob("*.json"))
+            self.assertEqual(len(queued), 1)
+            payload = json.loads(queued[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["reason"], "Instagram carousel extraction failed: visual=missing")
+            self.assertIn("очеред", result.lower())
+            self.assertNotIn(caption, result)
+            self.assertFalse((root / "instagram_cache" / "PHOTOONLY1.json").exists())
+
+    def test_default_metadata_failure_still_queues(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review_queue"
+            cache_dir = root / "instagram_cache"
+            queue_dir.mkdir()
+            cache_dir.mkdir()
+            with patch("normalizer.instagram_handler.config.REVIEW_QUEUE_DIR", queue_dir), \
+                 patch("normalizer.instagram_handler.config.INSTAGRAM_CACHE_DIR", cache_dir), \
+                 patch("normalizer.instagram_handler._get_info_ytdlp", return_value=None):
+                result = extract_instagram_text(
+                    "https://www.instagram.com/reel/QUEUE001/",
+                    channel_name="Channel",
+                    message_id=78,
+                    message_text="Post text",
+                )
+
+            queued = list(queue_dir.glob("*.json"))
+            self.assertEqual(len(queued), 1)
+            self.assertIn("очеред", result.lower())
+
+    def test_long_reel_without_queue_raises_and_writes_nothing(self):
+        info = {"description": "Caption", "uploader": "user", "duration": 999}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            queue_dir = root / "review_queue"
+            cache_dir = root / "instagram_cache"
+            queue_dir.mkdir()
+            cache_dir.mkdir()
+            with patch("normalizer.instagram_handler.config.REVIEW_QUEUE_DIR", queue_dir), \
+                 patch("normalizer.instagram_handler.config.INSTAGRAM_CACHE_DIR", cache_dir), \
+                 patch("normalizer.instagram_handler.config.INSTAGRAM_DEEP_EXTRACT_ENABLED", True), \
+                 patch("normalizer.instagram_handler.config.INSTAGRAM_MAX_VIDEO_DURATION_SEC", 180), \
+                 patch("normalizer.instagram_handler._get_info_ytdlp", return_value=info):
+                with self.assertRaises(InstagramExtractionError):
+                    extract_instagram_text(
+                        "https://www.instagram.com/reel/LONGREEL1/",
+                        channel_name="Channel",
+                        message_id=79,
+                        message_text="Post text",
+                        queue_failures=False,
+                    )
+
+            self.assertEqual(list(queue_dir.glob("*.json")), [])
+
+    def test_multiline_json_prefers_text_when_exit_is_nonzero(self):
+        stdout = "\n".join(
+            [
+                json.dumps({"id": "a", "description": "", "title": ""}),
+                "WARNING: no video formats",
+                json.dumps({"id": "b", "description": "Подпись карусели", "title": ""}),
+            ]
+        )
+        url = "https://www.instagram.com/p/CAROUSEL1/"
+        with patch(
+            "normalizer.instagram.downloader.check_ytdlp_version",
+            return_value={"status": "ok", "installed": "2026.07.04", "latest": "2026.07.04"},
+        ), patch.object(config, "INSTAGRAM_COOKIES_FILE", None), patch(
+            "normalizer.instagram.downloader.subprocess.run",
+            return_value=self._metadata(stdout, returncode=1, stderr="ERROR: no formats"),
+        ), self.assertLogs("geospoiler.normalizer.instagram", level="WARNING") as logs:
+            info = _get_info_ytdlp(url)
+
+        self.assertEqual(info["id"], "b")
+        self.assertEqual(info["description"], "Подпись карусели")
+        self.assertTrue(any("exited 1" in line for line in logs.output))
+        self.assertTrue(any(url in line for line in logs.output))
+
+    def test_photo_only_metadata_ignores_missing_formats(self):
+        url = "https://www.instagram.com/p/PHOTOONLY1/"
+        completed = self._metadata(json.dumps({"id": "photo1", "description": "Только фото"}))
+        with patch(
+            "normalizer.instagram.downloader.check_ytdlp_version",
+            return_value={"status": "ok", "installed": "2026.07.04", "latest": "2026.07.04"},
+        ), patch.object(config, "INSTAGRAM_COOKIES_FILE", None), patch(
+            "normalizer.instagram.downloader.subprocess.run",
+            return_value=completed,
+        ) as run:
+            info = _get_info_ytdlp(url)
+
+        command = run.call_args.args[0]
+        self.assertEqual(info["id"], "photo1")
+        self.assertEqual(info["description"], "Только фото")
+        self.assertIn("--ignore-no-formats-error", command)
+        self.assertNotIn("--cookies", command)
+
+    def test_cookies_file_is_passed_to_content_commands_only(self):
+        secret = "SECRET-COOKIE-VALUE"
+        url = "https://www.instagram.com/reel/ABC123/"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cookies = root / "session-cookies.txt"
+            cookies.write_text(secret, encoding="utf-8")
+            work = root / "work"
+            carousel = root / "carousel"
+            media = root / "media"
+            work.mkdir()
+            carousel.mkdir()
+            media.mkdir()
+            completed = self._metadata('{"id": "ABC123", "description": "caption"}')
+            info = {"id": "ABC123", "subtitles": {"ru": [{"ext": "vtt"}]}}
+            with patch(
+                "normalizer.instagram.downloader.check_ytdlp_version",
+                return_value={"status": "ok", "installed": "2026.07.04", "latest": "2026.07.04"},
+            ), patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch.object(
+                config, "MEDIA_CACHE_DIR", media
+            ), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                return_value=completed,
+            ) as run:
+                _get_info_ytdlp(url)
+                _download_video(url, work, "ABC123")
+                _download_carousel_images(url, carousel, "ABC123", info)
+                _get_subtitles_from_info(url, info)
+                installed_ytdlp_version()
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(len(commands), 5)
+            for command in commands[:4]:
+                joined = " ".join(command)
+                self.assertIn("--cookies", command)
+                self.assertIn(str(cookies), command)
+                self.assertNotIn(secret, joined)
+            version_command = commands[4]
+            self.assertEqual(version_command[:3], [sys.executable, "-m", "yt_dlp"])
+            self.assertIn("--version", version_command)
+            self.assertNotIn("--cookies", version_command)
+            self.assertNotIn(secret, " ".join(version_command))
+
+    def test_missing_cookies_file_warns_once_with_path_only(self):
+        url = "https://www.instagram.com/p/MISSING1/"
+        _logged_missing_cookie_files.clear()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "absent-cookies.txt"
+            completed = self._metadata(json.dumps({"id": "m", "description": "caption"}))
+            with patch(
+                "normalizer.instagram.downloader.check_ytdlp_version",
+                return_value={"status": "ok", "installed": "2026.07.04", "latest": "2026.07.04"},
+            ), patch.object(config, "INSTAGRAM_COOKIES_FILE", missing), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                return_value=completed,
+            ) as run, self.assertLogs("geospoiler.normalizer.instagram", level="WARNING") as logs:
+                first = _get_info_ytdlp(url)
+                second = _get_info_ytdlp(url)
+
+            warnings = [line for line in logs.output if "missing" in line]
+            self.assertEqual(first["id"], "m")
+            self.assertEqual(second["id"], "m")
+            self.assertEqual(warnings, [f"WARNING:geospoiler.normalizer.instagram:Instagram cookies file is missing: {missing}"])
+            for call in run.call_args_list:
+                self.assertNotIn("--cookies", call.args[0])
+                self.assertNotIn("SECRET-COOKIE-VALUE", " ".join(call.args[0]))
+
+    def test_cookie_stderr_does_not_reach_the_log(self):
+        secret = "SECRET-COOKIE-VALUE"
+        url = "https://www.instagram.com/reel/NOJSON1/"
+        stderr = "\n".join(
+            [
+                f"ERROR: [Cookies] could not decode cookie {secret}",
+                f".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t{secret}",
+                "ERROR: unable to download webpage",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookies = Path(tmpdir) / "session-cookies.txt"
+            cookies.write_text("not-the-logged-secret\n", encoding="utf-8")
+            completed = self._metadata("", returncode=1, stderr=stderr)
+            with patch(
+                "normalizer.instagram.downloader.check_ytdlp_version",
+                return_value={"status": "ok", "installed": "2026.07.04", "latest": "2026.07.04"},
+            ), patch.object(config, "INSTAGRAM_COOKIES_FILE", cookies), patch(
+                "normalizer.instagram.downloader.subprocess.run",
+                return_value=completed,
+            ), self.assertLogs("geospoiler.normalizer.instagram", level="WARNING") as logs:
+                info = _get_info_ytdlp(url)
+
+        logged = "\n".join(logs.output)
+        self.assertIsNone(info)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("sessionid", logged)
+        self.assertNotIn("Cookies", logged)
+        self.assertIn("unable to download webpage", logged)
+        self.assertIn("exit=1", logged)

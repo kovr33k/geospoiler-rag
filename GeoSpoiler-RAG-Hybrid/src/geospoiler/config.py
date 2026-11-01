@@ -193,6 +193,11 @@ if INSTAGRAM_MAX_VIDEO_DURATION_SEC <= 0:
     raise ValueError("INSTAGRAM_MAX_VIDEO_DURATION_SEC must be positive")
 if INSTAGRAM_MAX_VIDEO_SIZE_MB <= 0:
     raise ValueError("INSTAGRAM_MAX_VIDEO_SIZE_MB must be positive")
+# Empty stays unset. A relative path is anchored at the project root, like the other path settings.
+_instagram_cookies_file = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip()
+INSTAGRAM_COOKIES_FILE = (
+    PROJECT_ROOT / _instagram_cookies_file if _instagram_cookies_file else None
+)
 YTDLP_MIN_VERSION = os.getenv("YTDLP_MIN_VERSION", "2026.7.4")
 YTDLP_VERSION_CHECK_TIMEOUT_SECONDS = float(
     os.getenv("YTDLP_VERSION_CHECK_TIMEOUT_SECONDS", "10")

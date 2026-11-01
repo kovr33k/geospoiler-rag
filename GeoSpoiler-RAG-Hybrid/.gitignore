@@ -23,6 +23,8 @@ pytest-*/
 .env
 .env.*
 !.env.example
+# Instagram session cookies passed to yt-dlp. Never commit.
+*cookies*.txt
 state/
 
 # Generated local data

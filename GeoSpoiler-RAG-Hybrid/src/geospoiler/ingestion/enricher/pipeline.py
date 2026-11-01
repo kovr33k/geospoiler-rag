@@ -55,7 +55,12 @@ from geospoiler.ingestion.enricher.youtube_pipeline import (
     enrich_youtube_all,
 )
 from geospoiler.ingestion.normalizer.pipeline import read_normalized_meta
-from geospoiler.ingestion.normalizer.review_queue import REVIEW_TYPE_ENRICHMENT_FAILURE, REVIEW_TYPE_UNINFORMATIVE
+from geospoiler.ingestion.normalizer.review_queue import (
+    REVIEW_TYPE_ENRICHMENT_FAILURE,
+    REVIEW_TYPE_UNINFORMATIVE,
+    apply_reviewed_texts,
+    processed_reviews_for_post,
+)
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
 from geospoiler.ingestion.normalizer.youtube_handler import redact_sensitive_url
 from geospoiler.providers import llm_backend
@@ -204,8 +209,15 @@ def _collect_enrichment_jobs(
                     normalized_meta,
                     txt_path,
                 ):
-                    stats.skipped_youtube += 1
-                    continue
+                    # A failed extraction has no dedicated artifact. Reviewed text
+                    # is applied only by the generic job, so keep that post.
+                    reviewed = processed_reviews_for_post(
+                        _post_channel_name(txt_path, meta_name=normalized_meta.channel_name),
+                        txt_path.stem,
+                    )
+                    if not reviewed:
+                        stats.skipped_youtube += 1
+                        continue
             except (OSError, ValueError):
                 logger.warning("Cannot inspect metadata for %s", progress_key)
 
@@ -388,9 +400,16 @@ def _run_enrichment_job_with_retry(job: _EnrichmentJob, stats: EnrichmentStats) 
 
 def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | None:
     """Run the full enrichment pipeline for a single post."""
-    normalized_text = job.txt_path.read_text(encoding="utf-8")
+    # Reviewed text lives in the review JSON. The normalized file stays as written.
+    # Review files store the metadata channel, which can differ from the directory.
     meta = read_normalized_meta(job.txt_path)
     meta_data = meta.model_dump(mode="json")
+    review_channel = _post_channel_name(job.txt_path, meta_name=meta.channel_name)
+    review_items = processed_reviews_for_post(review_channel, job.txt_path.stem)
+    normalized_text = apply_reviewed_texts(
+        job.txt_path.read_text(encoding="utf-8"),
+        review_items,
+    )
 
     # 1. Content type classification (rule-based)
     content_type = classify_content(meta_data, normalized_text)
@@ -401,14 +420,16 @@ def _run_enrichment_job(job: _EnrichmentJob, stats: EnrichmentStats) -> dict | N
         _queue_uninformative_review(
             triage_reason=triage_reason,
             txt_path=job.txt_path,
-            channel_name=job.channel_name,
+            channel_name=review_channel,
             msg_id=job.msg_id,
             meta=meta_data,
         )
         return None
 
     roots = _duplicate_roots
-    key = post_content_key(meta, normalized_text) if roots is not None else None
+    # Reviewed facts sit in a "[" paragraph, which the content key ignores.
+    # A reviewed post is extracted itself: it is not copied and not copied from.
+    key = post_content_key(meta, normalized_text) if roots is not None and not review_items else None
     if key is None:
         return _extract_card(job, stats, meta, normalized_text, content_type)
     source_id = _build_source_id(meta, job.channel_name, job.msg_id)
@@ -888,7 +909,10 @@ def _queue_enrichment_failure(job: _EnrichmentJob, exc: Exception) -> str | None
         post_url = redact_sensitive_url(str(meta.get("post_url") or ""))
     result = queue_review_item(
         review_type=REVIEW_TYPE_ENRICHMENT_FAILURE,
-        channel_name=job.channel_name,
+        channel_name=_post_channel_name(
+            job.txt_path,
+            meta_name=str(meta.get("channel_name") or "") if isinstance(meta, dict) else "",
+        ),
         message_id=message_id,
         message_text=message_text,
         message_date=message_date,
@@ -999,7 +1023,9 @@ def _load_duplicate_roots() -> DuplicateRoots:
     The earliest current card of a key that is not a copy of another one is
     the root; every other card of the key gets duplicate_of. A mark that no
     longer matches is rewritten or cleared, so a changed root never hides the
-    posts that used to copy it.
+    posts that used to copy it. A post with processed review text is left out
+    of this index: that text is not in the file the key reads, and the card
+    must stay its own.
     """
     groups: dict[str, list[tuple[Path, EnrichedCardV2]]] = {}
     for txt_path in sorted(config.NORMALIZED_DIR.glob("*/*.txt")):
@@ -1009,6 +1035,12 @@ def _load_duplicate_roots() -> DuplicateRoots:
             continue
         try:
             meta = read_normalized_meta(txt_path, recover=False)
+            # Same rule as live reuse: a reviewed post is neither a root nor a copy.
+            if processed_reviews_for_post(
+                _post_channel_name(txt_path, meta_name=meta.channel_name),
+                txt_path.stem,
+            ):
+                continue
             key = post_content_key(meta, txt_path.read_text(encoding="utf-8"))
             source_id = _build_source_id(meta, channel_name, msg_id)
             if key is None or not _is_valid_enriched_output(card_path, source_id):
@@ -1170,11 +1202,62 @@ def _is_valid_enriched_output(path: Path, expected_source_id: str | None) -> boo
 
 
 def _source_fingerprint(txt_path: Path, meta_path: Path) -> str:
-    """Hash both normalized inputs so metadata-only changes invalidate a card."""
+    """Hash both normalized inputs so metadata-only changes invalidate a card.
+
+    Applicable reviewed texts are mixed in only when this post has some.
+    Posts with no review items keep the historical fingerprint, so the
+    existing archive is not regenerated.
+    """
     digest = hashlib.sha256()
+    meta_bytes = b""
     for label, path in ((b"text", txt_path), (b"meta", meta_path)):
         data = path.read_bytes()
+        if path == meta_path:
+            meta_bytes = data
         digest.update(label)
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
+    review_digest = _applicable_review_digest(txt_path, meta_bytes)
+    if review_digest is not None:
+        digest.update(b"reviews")
+        digest.update(len(review_digest).to_bytes(8, "big"))
+        digest.update(review_digest)
     return digest.hexdigest()
+
+
+def _post_channel_name(
+    txt_path: Path,
+    *,
+    meta_name: str | None = None,
+    meta_bytes: bytes | None = None,
+) -> str:
+    """Channel stored on a review item.
+
+    Directory names replace characters such as ``/``. The review JSON keeps
+    the original ``channel_name`` and lookups must use that same string.
+    """
+    if meta_name is None and meta_bytes is not None:
+        try:
+            parsed = json.loads(meta_bytes)
+        except (UnicodeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            meta_name = parsed.get("channel_name")
+    name = str(meta_name or "").strip()
+    return name or txt_path.parent.name
+
+
+def _applicable_review_digest(txt_path: Path, meta_bytes: bytes) -> bytes | None:
+    """Stable digest of (file name, extracted_text) for one normalized post."""
+    items = processed_reviews_for_post(
+        _post_channel_name(txt_path, meta_bytes=meta_bytes),
+        txt_path.stem,
+    )
+    if not items:
+        return None
+    payload = [
+        (str(item.get("_filename") or ""), str(item.get("extracted_text") or ""))
+        for item in items
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).digest()

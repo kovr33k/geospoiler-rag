@@ -46,9 +46,12 @@ def auto_triage(
     body = _extract_body(normalized_text)
     body_stripped = body.strip()
 
-    # ── Rule 1: AI chat → review (existing review_queue mechanism handles these) ──
+    # ── Rule 1: AI chat → review until a human extraction is in the text ──
+    # ai_chat_urls would otherwise send the post back to review forever, even
+    # after the placeholder was replaced with processed review text.
     if content_type == "ai_chat" or meta.get("ai_chat_urls"):
-        return TRIAGE_REVIEW, "AI chat — requires manual review"
+        if not _has_applied_review_text(body):
+            return TRIAGE_REVIEW, "AI chat — requires manual review"
 
     # ── Rule 2: Native video without useful caption → review ──
     if content_type == "video_native":
@@ -81,6 +84,11 @@ def _extract_body(normalized_text: str) -> str:
             continue
         body_lines.append(line)
     return "\n".join(body_lines)
+
+
+def _has_applied_review_text(body: str) -> bool:
+    """True when processed review text is present and not just another marker."""
+    return "[Текст из ревью:" in body and _has_meaningful_text(body)
 
 
 def _has_meaningful_text(body: str) -> bool:
