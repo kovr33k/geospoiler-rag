@@ -7,7 +7,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from normalizer.web_handler import extract_web_text  # noqa: E402
+from normalizer.web_handler import (  # noqa: E402
+    _MAX_ARTICLE_CHARS,
+    _NO_WAIT,
+    extract_web_text,
+)
 
 _ARTICLE = "Порт Нарвы закрыли после удара по причалу, движение судов остановлено. "
 
@@ -53,22 +57,48 @@ class WebHandlerTests(unittest.TestCase):
         self.assertEqual(config.delay_before_return_html, 4.0)
         self.assertEqual(config.page_timeout, 60000)
         self.assertEqual(config.excluded_tags, ["nav", "header", "footer", "aside", "form"])
+        self.assertIn(".cky-modal", config.excluded_selector)
+        self.assertNotIn('[role="dialog"]', config.excluded_selector)
+        self.assertTrue(config.remove_consent_popups)
+        self.assertFalse(config.remove_overlay_elements)
+        self.assertTrue(config.exclude_all_images)
         self.assertTrue(text.startswith(f"[Веб: {url}]\n"))
         self.assertIn("Порт Нарвы", text)
 
-    def test_failed_or_timed_out_crawl_retries_once_with_defaults(self):
+    def test_long_article_is_kept_whole(self):
+        url = "https://example.com/story"
+        article = _ARTICLE * 400  # ~29k chars, a long investigation
+        text = _run(_Crawler([_page(article)]), url)
+
+        self.assertEqual(text, f"[Веб: {url}]\n{article}")
+        self.assertNotIn("текст обрезан", text)
+
+    def test_runaway_page_is_capped(self):
+        url = "https://example.com/feed"
+        endless = "ъ" * (_MAX_ARTICLE_CHARS + 500)
+        text = _run(_Crawler([_page(endless)]), url)
+
+        self.assertTrue(text.endswith("\n[...текст обрезан]"))
+        self.assertEqual(text.count("ъ"), _MAX_ARTICLE_CHARS)
+
+    def test_failed_or_timed_out_crawl_retries_once_without_the_wait(self):
         url = "https://example.com/story"
         failed = _Crawler([
             _page(success=False, markdown="", error_message="blocked"),
             _page(),
         ])
         text = _run(failed, url)
-        self.assertEqual([config is None for _url, config in failed.calls], [False, True])
+        self.assertEqual(
+            [config.wait_until for _url, config in failed.calls],
+            ["networkidle", _NO_WAIT.wait_until],
+        )
+        self.assertNotEqual(_NO_WAIT.wait_until, "networkidle")
+        self.assertTrue(failed.calls[1][1].remove_consent_popups)
         self.assertIn("Порт Нарвы", text)
 
         timed_out = _Crawler([TimeoutError("page timeout"), _page()])
         _run(timed_out, url)
-        self.assertIsNone(timed_out.calls[1][1])
+        self.assertIs(timed_out.calls[1][1], _NO_WAIT)
 
         wrapped = _Crawler([
             RuntimeError("Failed on navigating ACS-GOTO:\nTimeout 60000ms exceeded"),
@@ -76,7 +106,7 @@ class WebHandlerTests(unittest.TestCase):
         ])
         _run(wrapped, url)
         self.assertEqual(len(wrapped.calls), 2)
-        self.assertIsNone(wrapped.calls[1][1])
+        self.assertIs(wrapped.calls[1][1], _NO_WAIT)
 
         still_failed = _Crawler([
             _page(success=False, markdown="", error_message="blocked"),
@@ -93,7 +123,7 @@ class WebHandlerTests(unittest.TestCase):
         errored = _run(other_error, url)
         self.assertEqual(errored, f"[Веб: {url} — ошибка обработки]")
         self.assertEqual(len(other_error.calls), 2)
-        self.assertIsNone(other_error.calls[1][1])
+        self.assertIs(other_error.calls[1][1], _NO_WAIT)
 
     def test_public_telegram_post_is_crawled_as_an_embed(self):
         original = "https://t.me/narva_news/42"
