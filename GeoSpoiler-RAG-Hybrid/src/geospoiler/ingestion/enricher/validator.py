@@ -29,6 +29,11 @@ _UKRAINIAN_SPECIFIC_RE = re.compile(r"[іїєґІЇЄҐ]")
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
+# Ukrainian proper names stay in their original form: a capitalized word such as
+# \u041d\u0456\u043a\u0456\u0442\u0430, or a short quoted title such as \u00ab\u041c\u0438\u0440\u043e\u0442\u0432\u043e\u0440\u0435\u0446\u044c\u00bb. Ukrainian prose still
+# fails because its lowercase words remain.
+_CAPITALIZED_WORD_RE = re.compile(r"(?<![\w'\u2019\u02bc-])[\u0410-\u042f\u0401\u0406\u0407\u0404\u0490][\w'\u2019\u02bc-]*")
+_QUOTED_NAME_RE = re.compile(r'\u00ab[^\u00ab\u00bb]{1,40}\u00bb|\u201c[^\u201c\u201d]{1,40}\u201d|"[^"]{1,40}"')
 _REQUIRED_RUSSIAN_FIELDS = (
     ("summary", lambda payload: [payload.summary]),
     ("key_points", lambda payload: [item.text for item in payload.key_points]),
@@ -92,7 +97,9 @@ def required_russian_violations(payload: LLMPayload) -> list[str]:
             text = str(value or "").strip()
             if not text:
                 continue
-            candidate = _without_entity_surface_forms(text, entity_forms)
+            candidate = _without_proper_names(
+                _without_entity_surface_forms(text, entity_forms)
+            )
             reason = non_russian_prose_reason(candidate)
             if reason is None:
                 continue
@@ -145,10 +152,18 @@ def _without_entity_surface_forms(text: str, entity_forms: list[str]) -> str:
     return candidate
 
 
+def _without_proper_names(text: str) -> str:
+    return _CAPITALIZED_WORD_RE.sub(" ", _QUOTED_NAME_RE.sub(" ", text))
+
+
 def non_russian_prose_reason(text: str) -> str | None:
     ukrainian_count = len(_UKRAINIAN_SPECIFIC_RE.findall(text))
     if ukrainian_count:
-        return f"contains Ukrainian prose ({ukrainian_count} language-specific character(s))"
+        words = sorted({w for w in re.findall(r"[\w'’ʼ-]+", text) if _UKRAINIAN_SPECIFIC_RE.search(w)})
+        return (
+            f"contains Ukrainian prose ({ukrainian_count} language-specific character(s): "
+            f"{', '.join(words[:5])})"
+        )
 
     cyrillic_count = len(_CYRILLIC_RE.findall(text))
     latin_count = len(_LATIN_RE.findall(text))

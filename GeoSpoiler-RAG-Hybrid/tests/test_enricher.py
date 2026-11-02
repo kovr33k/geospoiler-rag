@@ -131,6 +131,36 @@ class PipelineQualityFlagTests(unittest.TestCase):
 
         self.assertTrue(has_required_language_violations(result))
 
+    def test_ukrainian_proper_names_are_allowed_in_russian_prose(self):
+        payload = LLMPayload(
+            summary=(
+                "Скі-альпинист Нікіта Філіппов попал в базу «Миротворець» "
+                "после расследования Molfar."
+            ),
+            key_points=[{"text": "Сайт \"Миротворець\" опубликовал данные о Філіппове."}],
+        )
+
+        result = validate_payload(payload, "Нікіта Філіппов потрапив в базу «Миротворець».")
+
+        self.assertFalse(has_required_language_violations(result), result.violations)
+
+    def test_ukrainian_prose_after_a_capitalized_word_is_rejected(self):
+        payload = LLMPayload(summary="Всі звинувачення спортсмен відкидає.")
+
+        result = validate_payload(payload, "Всі звинувачення спортсмен відкидає.")
+
+        self.assertTrue(has_required_language_violations(result))
+        self.assertIn("відкидає", " ".join(result.violations))
+
+    def test_long_ukrainian_quote_inside_summary_is_rejected(self):
+        payload = LLMPayload(
+            summary="Автор пишет: «спортсмен відкидає всі звинувачення і продовжує виступати»."
+        )
+
+        result = validate_payload(payload, "спортсмен відкидає всі звинувачення.")
+
+        self.assertTrue(has_required_language_violations(result))
+
     def test_all_required_semantic_collections_enforce_russian(self):
         cases = {
             "key_points": {
@@ -574,6 +604,36 @@ class EnrichmentFailurePolicyTests(unittest.TestCase):
         self.assertEqual(stats.failed, 0)
         self.assertEqual(stats.enriched, 1)
         self.assertIn("Channel/1", progress["enriched"])
+
+    def test_success_closes_the_pending_failure_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            jobs = self._make_jobs(root, 2)
+            reviews = {}
+            for job, status in zip(jobs, ("pending", "processed"), strict=True):
+                path = root / f"{job.msg_id}_failure.json"
+                path.write_text(
+                    json.dumps({"review_type": "enrichment_failure", "status": status}),
+                    encoding="utf-8",
+                )
+                reviews[job.progress_key] = path
+            progress = {
+                "enriched": {},
+                "failed": {key: {"status": "review", "review_path": str(path)} for key, path in reviews.items()},
+            }
+            stats = enricher_pipeline.EnrichmentStats()
+            card = {"summary": "Повторная попытка успешно завершилась.", "content_type": "telegram_post"}
+
+            with patch.object(enricher_pipeline, "_PROGRESS_FILE", root / "enrichment_progress.json"):
+                for job in jobs:
+                    enricher_pipeline._handle_enrichment_result(job, dict(card), progress, stats)
+            statuses = [
+                json.loads(reviews[job.progress_key].read_text(encoding="utf-8"))["status"]
+                for job in jobs
+            ]
+
+        self.assertEqual(statuses, ["skipped", "processed"])
+        self.assertEqual(progress["failed"], {})
 
     def test_final_failure_is_recorded_with_fingerprint_and_reason(self):
         with tempfile.TemporaryDirectory() as tmpdir:
