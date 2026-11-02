@@ -10,14 +10,31 @@ from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 
 logger = logging.getLogger("geospoiler.normalizer.web")
 
+# The whole article is kept. This cap only stops runaway pages such as endless
+# feeds; enrichment splits long text into chunks itself.
+_MAX_ARTICLE_CHARS = 120_000
+# Cookie banners and consent dialogs are not article text. Generic dialogs and
+# overlays stay: Facebook renders the post itself inside one.
+_PAGE_CHROME = dict(
+    excluded_tags=["nav", "header", "footer", "aside", "form"],
+    excluded_selector=(
+        "#onetrust-consent-sdk, #CybotCookiebotDialog, #didomi-host, "
+        "#usercentrics-root, .qc-cmp2-container, "
+        "#cookie-law-info-bar, .cli-modal, .cky-consent-container, .cky-modal"
+    ),
+    remove_consent_popups=True,
+    exclude_all_images=True,
+    exclude_social_media_links=True,
+)
 # Script-rendered pages (ChatGPT, Gemini) stay empty unless the crawl waits.
-# A failed or timed-out run is retried once with crawl4ai's own defaults.
+# A failed or timed-out run is retried once without the wait.
 _SCRIPT_WAIT = CrawlerRunConfig(
     wait_until="networkidle",
     delay_before_return_html=4.0,
     page_timeout=60000,
-    excluded_tags=["nav", "header", "footer", "aside", "form"],
+    **_PAGE_CHROME,
 )
+_NO_WAIT = CrawlerRunConfig(**_PAGE_CHROME)
 # Public post: t.me/<channel>/<id>. Previews (t.me/s/...) and private posts
 # (t.me/c/...) are different paths and stay unchanged.
 _TELEGRAM_POST_PATH = re.compile(r"^/([^/]+)/(\d+)/?$")
@@ -45,7 +62,7 @@ def _telegram_embed_url(url: str) -> str:
 
 
 async def _crawl_page(crawler, crawl_url: str):
-    """Wait for scripts first. Any failure retries once with crawl4ai defaults."""
+    """Wait for scripts first. Any failure retries once without the wait."""
     try:
         result = await crawler.arun(url=crawl_url, config=_SCRIPT_WAIT)
         if result.success:
@@ -54,11 +71,11 @@ async def _crawl_page(crawler, crawl_url: str):
     except Exception as exc:
         detail = exc
     logger.warning(
-        "Crawl4AI failed for %s: %s; retrying with defaults",
+        "Crawl4AI failed for %s: %s; retrying without the wait",
         crawl_url,
         detail,
     )
-    return await crawler.arun(url=crawl_url)
+    return await crawler.arun(url=crawl_url, config=_NO_WAIT)
 
 
 async def extract_web_text(url: str) -> str:
@@ -80,9 +97,16 @@ async def extract_web_text(url: str) -> str:
             if not markdown_content or len(markdown_content.strip()) < 50:
                 return f'[Веб: {url}]\n[Содержание не удалось извлечь]'
 
-            # Limit very long articles
-            if len(markdown_content) > 10000:
-                markdown_content = markdown_content[:10000] + "\n[...текст обрезан]"
+            if len(markdown_content) > _MAX_ARTICLE_CHARS:
+                logger.warning(
+                    "Web page %s has %d chars; keeping the first %d",
+                    url,
+                    len(markdown_content),
+                    _MAX_ARTICLE_CHARS,
+                )
+                markdown_content = (
+                    markdown_content[:_MAX_ARTICLE_CHARS] + "\n[...текст обрезан]"
+                )
 
             return f"[Веб: {url}]\n{markdown_content}"
 
