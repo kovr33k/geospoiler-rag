@@ -610,7 +610,7 @@ class EnrichmentFailurePolicyTests(unittest.TestCase):
             root = Path(tmpdir)
             jobs = self._make_jobs(root, 2)
             reviews = {}
-            for job, status in zip(jobs, ("pending", "processed")):
+            for job, status in zip(jobs, ("pending", "processed"), strict=True):
                 path = root / f"{job.msg_id}_failure.json"
                 path.write_text(
                     json.dumps({"review_type": "enrichment_failure", "status": status}),
