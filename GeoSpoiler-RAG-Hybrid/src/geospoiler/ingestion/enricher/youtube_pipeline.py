@@ -460,8 +460,9 @@ def _merge_episode_payload(
             fallback = _deterministic_episode_payload(segment_payloads)
             if fallback.summary or fallback.key_points:
                 logger.warning(
-                    "YouTube episode merge failed; publishing deterministic segment fallback for %s",
+                    "YouTube episode merge failed; publishing deterministic segment fallback for %s: %s",
                     source.get("video_id") or source.get("url"),
+                    "; ".join(issues)[:1000] or "extraction_unstable",
                 )
                 return fallback, []
         return payload, issues

@@ -59,6 +59,7 @@ from geospoiler.ingestion.normalizer.review_queue import (
     REVIEW_TYPE_ENRICHMENT_FAILURE,
     REVIEW_TYPE_UNINFORMATIVE,
     apply_reviewed_texts,
+    mark_reviewed,
     processed_reviews_for_post,
 )
 from geospoiler.ingestion.normalizer.review_queue import queue_item as queue_review_item
@@ -808,7 +809,7 @@ def _handle_enrichment_result(
         if not isinstance(failed, dict):
             failed = {}
             progress["failed"] = failed
-        failed.pop(job.progress_key, None)
+        _close_failure_review(failed.pop(job.progress_key, None))
         progress["enriched"][job.progress_key] = {
             "enriched_at": datetime.now(UTC).isoformat(),
             "source_fingerprint": job.source_fingerprint,
@@ -866,6 +867,23 @@ def _record_enrichment_failure(
         f"  Failed to enrich {job.progress_key}: {exc}",
         exc_info=True,
     )
+
+
+def _close_failure_review(failure: dict | None) -> None:
+    """A post that now has a card no longer waits in the reviewer for its old failure."""
+    review_path = failure.get("review_path") if isinstance(failure, dict) else None
+    if not review_path:
+        return
+    try:
+        review = json.loads(config.resolve_project_path(review_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    if (
+        isinstance(review, dict)
+        and review.get("review_type") == REVIEW_TYPE_ENRICHMENT_FAILURE
+        and review.get("status") == "pending"
+    ):
+        mark_reviewed(review_path, "", skip=True)
 
 
 def _safe_failure_message(exc: Exception) -> str:
